@@ -147,7 +147,14 @@ def run_preprocess(cfg):
     if not static_cam:  # use slam to get cam rotation
         if not Path(paths.slam).exists():
             if not cfg.use_dpvo:
-                simple_vo = SimpleVO(cfg.video_path, scale=0.5, step=8, method="sift", f_mm=cfg.f_mm)
+                simple_vo = SimpleVO(
+                    cfg.video_path,
+                    scale=0.5,
+                    step=8,
+                    method="sift",
+                    f_mm=cfg.f_mm,
+                    num_workers=int(getattr(cfg, "simple_vo_workers", 1)),
+                )
                 vo_results = simple_vo.compute()  # (L, 4, 4), numpy
                 torch.save(vo_results, paths.slam)
             else:  # DPVO

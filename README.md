@@ -40,6 +40,13 @@ python tools/demo/demo.py --video=docs/example_video/tennis.mp4 -s
 python tools/demo/demo_folder.py -f inputs/demo/folder_in -d outputs/demo/folder_out -s
 ```
 
+### MotiForge headless backend
+
+The versioned `hmr4d.backends.motiforge` entry point lets the sibling MotiForge
+project orchestrate headless GVHMR inference without sharing Python environments
+or vendoring this code. Setup, runtime checks and the portable artifact contract
+are documented in [docs/MOTIFORGE_BACKEND.md](docs/MOTIFORGE_BACKEND.md).
+
 ### Reproduce
 1. **Test**:
 To reproduce the 3DPW, RICH, and EMDB results in a single run, use the following command:
