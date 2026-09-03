@@ -45,7 +45,10 @@ python tools/demo/demo_folder.py -f inputs/demo/folder_in -d outputs/demo/folder
 The versioned `hmr4d.backends.motiforge` entry point lets the sibling MotiForge
 project orchestrate headless GVHMR inference without sharing Python environments
 or vendoring this code. Setup, runtime checks and the portable artifact contract
-are documented in [docs/MOTIFORGE_BACKEND.md](docs/MOTIFORGE_BACKEND.md).
+are documented in [docs/MOTIFORGE_BACKEND.md](docs/MOTIFORGE_BACKEND.md). The
+backend also exports the checkpoint's foot-contact confidence and uses sustained
+contacts to remove slow vertical world-floor drift while preserving predicted
+flight; this source correction can be disabled from MotiForge for ablation.
 
 ### Reproduce
 1. **Test**:

@@ -8,6 +8,7 @@ from hmr4d.backends.motiforge import (
     COMMON_ASSETS,
     _ffmpeg_command,
     _portable_prediction,
+    _stabilize_world_ground,
     _write_portable_npz,
     diagnose,
 )
@@ -67,6 +68,9 @@ class MotiForgeBackendTests(unittest.TestCase):
                 "smpl_params_global": params,
                 "smpl_params_incam": params,
                 "K_fullimg": torch.eye(3).repeat(3, 1, 1),
+                "net_outputs": {
+                    "static_conf_logits": torch.full((1, 3, 6), 10.0),
+                },
             },
             model=Model(),
             detach_to_cpu=lambda value: value,
@@ -78,10 +82,49 @@ class MotiForgeBackendTests(unittest.TestCase):
         )
 
         self.assertEqual(tuple(portable["pred_w_j3d"].shape), (3, 22, 3))
+        self.assertEqual(tuple(portable["left_contact_confidence"].shape), (3,))
+        self.assertEqual(tuple(portable["floor_correction_y"].shape), (3,))
         metadata = portable["motiforge_video"]
         self.assertEqual(metadata["gvhmr_revision"], "gvhmr-revision")
         self.assertEqual(metadata["gvhmr_backend_revision"], "backend-revision")
         self.assertEqual(metadata["simple_vo_workers"], 4)
+        self.assertEqual(metadata["ground_stabilization"]["version"], "contact-floor-v1")
+
+    def test_ground_stabilization_removes_floor_drift_but_preserves_flight(self) -> None:
+        import numpy as np
+
+        frames = 90
+        joints = np.zeros((frames, 22, 3), dtype=np.float32)
+        joints[:, :, 1] = 1.0
+        drift = np.linspace(0.0, 0.12, frames, dtype=np.float32)
+        for index in (7, 10, 8, 11):
+            joints[:, index, 1] = drift
+        flight = slice(36, 51)
+        joints[flight, (7, 10, 8, 11), 1] += 0.16
+        transl = np.zeros((frames, 3), dtype=np.float32)
+        transl[:, 1] = 1.0 + drift
+        left = np.ones(frames, dtype=np.float32)
+        right = np.ones(frames, dtype=np.float32)
+        left[flight] = 0.01
+        right[flight] = 0.01
+
+        world, root, correction, diagnostics = _stabilize_world_ground(
+            joints,
+            transl,
+            (left, right),
+            fps=30.0,
+            enabled=True,
+        )
+
+        support_y = np.minimum(world[:, 10, 1], world[:, 11, 1])
+        contacts = np.ones(frames, dtype=bool)
+        contacts[flight] = False
+        self.assertTrue(diagnostics["applied"])
+        self.assertLess(float(np.percentile(np.abs(support_y[contacts]), 95)), 0.01)
+        self.assertGreater(float(np.min(support_y[flight])), 0.12)
+        self.assertGreaterEqual(float(support_y.min()), -1e-6)
+        self.assertLessEqual(float(np.max(np.abs(np.diff(correction))) * 30.0), 0.200001)
+        np.testing.assert_allclose(root[:, 1], 1.0 + drift - correction, atol=1e-6)
 
     def test_portable_npz_is_pickle_free_and_preserves_nested_parameters(self) -> None:
         import json

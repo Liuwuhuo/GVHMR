@@ -48,6 +48,11 @@ RUNTIME_MODULES = (
     "ultralytics",
 )
 
+_STATIC_JOINT_IDS = (7, 10, 8, 11)
+_CONTACT_THRESHOLD = 0.8
+_MAX_GROUND_CORRECTION_M = 0.25
+_MAX_GROUND_SPEED_MPS = 0.20
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -277,6 +282,203 @@ def _normalize_video(source: Path, destination: Path, options: dict[str, Any]) -
         raise RuntimeError(f"ffmpeg 视频标准化失败：{detail[0]}")
 
 
+def _contact_confidence(pred: dict[str, Any], frame_count: int) -> tuple[np.ndarray, np.ndarray] | None:
+    """Extract the checkpoint's semantic left/right foot contact confidence."""
+
+    net_outputs = pred.get("net_outputs")
+    if not isinstance(net_outputs, dict):
+        return None
+    logits = net_outputs.get("static_conf_logits")
+    if logits is None:
+        return None
+    values = _numpy_array(logits).astype(np.float64, copy=False)
+    if values.ndim == 3 and values.shape[0] == 1:
+        values = values[0]
+    if values.ndim != 2 or values.shape[1] < len(_STATIC_JOINT_IDS):
+        raise RuntimeError(
+            "GVHMR static_conf_logits 形状异常："
+            f"expected (T, >=4), got {values.shape}"
+        )
+    if values.shape[0] == frame_count - 1:
+        values = np.concatenate((values, values[-1:]), axis=0)
+    if values.shape[0] != frame_count:
+        raise RuntimeError(
+            "GVHMR 接触置信度帧数异常："
+            f"expected {frame_count}, got {values.shape[0]}"
+        )
+    probabilities = 1.0 / (1.0 + np.exp(-np.clip(values[:, :4], -40.0, 40.0)))
+    left = np.maximum(probabilities[:, 0], probabilities[:, 1])
+    right = np.maximum(probabilities[:, 2], probabilities[:, 3])
+    return left.astype(np.float32), right.astype(np.float32)
+
+
+def _remove_short_runs(mask: np.ndarray, minimum: int) -> np.ndarray:
+    """Drop isolated contact predictions without eroding sustained support."""
+
+    result = np.asarray(mask, dtype=bool).copy()
+    start = None
+    for index, active in enumerate(np.append(result, False)):
+        if active and start is None:
+            start = index
+        elif not active and start is not None:
+            if index - start < minimum:
+                result[start:index] = False
+            start = None
+    return result
+
+
+def _smooth_curve(values: np.ndarray, window: int) -> np.ndarray:
+    if window <= 1:
+        return values.copy()
+    window = min(window, len(values) if len(values) % 2 else len(values) - 1)
+    if window <= 1:
+        return values.copy()
+    if window % 2 == 0:
+        window -= 1
+    radius = window // 2
+    padded = np.pad(values, (radius, radius), mode="edge")
+    median = np.asarray(
+        [np.median(padded[index : index + window]) for index in range(len(values))]
+    )
+    weights = np.arange(1, radius + 2, dtype=np.float64)
+    weights = np.concatenate((weights, weights[-2::-1]))
+    weights /= weights.sum()
+    return np.convolve(np.pad(median, (radius, radius), mode="edge"), weights, mode="valid")
+
+
+def _lipschitz_minorant(values: np.ndarray, max_step: float) -> np.ndarray:
+    """Largest two-sided rate-limited curve that never exceeds ``values``."""
+
+    limited = np.asarray(values, dtype=np.float64).copy()
+    for index in range(1, len(limited)):
+        limited[index] = min(limited[index], limited[index - 1] + max_step)
+    for index in range(len(limited) - 2, -1, -1):
+        limited[index] = min(limited[index], limited[index + 1] + max_step)
+    return limited
+
+
+def _stabilize_world_ground(
+    joints: np.ndarray,
+    transl: np.ndarray,
+    contacts: tuple[np.ndarray, np.ndarray] | None,
+    *,
+    fps: float,
+    enabled: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Remove slow vertical world drift while preserving predicted flight.
+
+    GVHMR's static-camera postprocessor intentionally leaves the world Y axis
+    untouched.  That is safe for visualization but lets a stationary support
+    foot drift vertically.  We use the model's own static-foot logits as floor
+    observations, interpolate only the slow floor component through flight,
+    and apply the same correction to joints and SMPL translation.
+    """
+
+    world = np.asarray(joints, dtype=np.float32).copy()
+    root = np.asarray(transl, dtype=np.float32).copy()
+    frame_count = world.shape[0]
+    correction = np.zeros(frame_count, dtype=np.float32)
+    diagnostics: dict[str, Any] = {
+        "version": "contact-floor-v1",
+        "enabled": bool(enabled),
+        "applied": False,
+        "contact_threshold": _CONTACT_THRESHOLD,
+    }
+    if contacts is None:
+        diagnostics["reason"] = "contact_confidence_unavailable"
+        return world, root, correction, diagnostics
+
+    left_confidence, right_confidence = contacts
+    left_y = np.minimum(world[:, 7, 1], world[:, 10, 1]).astype(np.float64)
+    right_y = np.minimum(world[:, 8, 1], world[:, 11, 1]).astype(np.float64)
+    minimum_run = max(2, round(fps * 0.10))
+    left_contact = _remove_short_runs(left_confidence >= _CONTACT_THRESHOLD, minimum_run)
+    right_contact = _remove_short_runs(right_confidence >= _CONTACT_THRESHOLD, minimum_run)
+    support = left_contact | right_contact
+    diagnostics.update(
+        {
+            "contact_frames": {
+                "left": int(left_contact.sum()),
+                "right": int(right_contact.sum()),
+            },
+            "flight_frames": int((~support).sum()),
+        }
+    )
+    if not enabled:
+        diagnostics["reason"] = "disabled"
+        return world, root, correction, diagnostics
+    if support.sum() < max(3, minimum_run):
+        diagnostics["reason"] = "insufficient_contact"
+        return world, root, correction, diagnostics
+
+    support_y = np.full(frame_count, np.nan, dtype=np.float64)
+    only_left = left_contact & ~right_contact
+    only_right = right_contact & ~left_contact
+    both = left_contact & right_contact
+    support_y[only_left] = left_y[only_left]
+    support_y[only_right] = right_y[only_right]
+    support_y[both] = np.minimum(left_y[both], right_y[both])
+    anchor_indices = np.flatnonzero(support)
+    anchor_values = support_y[anchor_indices]
+    target_height = float(np.percentile(anchor_values, 10.0))
+    sampled_correction = anchor_values - target_height
+    timeline = np.arange(frame_count)
+    interpolated = np.interp(timeline, anchor_indices, sampled_correction)
+    window = max(3, round(fps * 0.25) | 1)
+    stabilized = _smooth_curve(interpolated, window)
+    stabilized = np.clip(
+        stabilized,
+        -_MAX_GROUND_CORRECTION_M,
+        _MAX_GROUND_CORRECTION_M,
+    )
+
+    # Never turn a low foot into ground penetration.  This constraint also
+    # prevents an erroneous future contact anchor from pulling down a real
+    # jump whose current support evidence is absent.  Project both the desired
+    # curve and its ceiling onto the same Lipschitz bound so releasing that
+    # ceiling at toe-off cannot create a one-frame root jump.
+    lowest_foot = np.minimum(left_y, right_y)
+    max_step = _MAX_GROUND_SPEED_MPS / fps
+    stabilized = np.minimum(
+        _lipschitz_minorant(stabilized, max_step),
+        _lipschitz_minorant(lowest_foot - target_height, max_step),
+    )
+    if float(np.max(np.abs(stabilized))) < 0.005:
+        diagnostics.update(
+            {
+                "reason": "correction_below_threshold",
+                "target_foot_height_m": target_height,
+                "max_abs_correction_m": float(np.max(np.abs(stabilized))),
+            }
+        )
+        return world, root, correction, diagnostics
+
+    correction = stabilized.astype(np.float32)
+    world[:, :, 1] -= correction[:, None]
+    root[:, 1] -= correction
+    corrected_left_y = np.minimum(world[:, 7, 1], world[:, 10, 1])
+    corrected_right_y = np.minimum(world[:, 8, 1], world[:, 11, 1])
+    corrected_support = np.where(
+        left_contact & right_contact,
+        np.minimum(corrected_left_y, corrected_right_y),
+        np.where(left_contact, corrected_left_y, corrected_right_y),
+    )
+    residual = np.abs(corrected_support[support] - target_height)
+    diagnostics.update(
+        {
+            "applied": True,
+            "target_foot_height_m": target_height,
+            "max_abs_correction_m": float(np.max(np.abs(correction))),
+            "p95_abs_correction_m": float(np.percentile(np.abs(correction), 95.0)),
+            "contact_height_p95_error_m": float(np.percentile(residual, 95.0)),
+            "max_correction_speed_mps": float(
+                np.max(np.abs(np.diff(correction))) * fps if frame_count > 1 else 0.0
+            ),
+        }
+    )
+    return world, root, correction, diagnostics
+
+
 def _portable_prediction(
     *,
     pred,
@@ -290,17 +492,29 @@ def _portable_prediction(
 ) -> dict[str, Any]:
     global_params = pred["smpl_params_global"]
     batched = {key: value[None] for key, value in global_params.items()}
-    pred_w_j3d = model.pipeline.endecoder.fk_v2(**batched)[0]
+    pred_w_j3d = model.pipeline.endecoder.fk_v2(**batched)[0].detach().cpu().numpy()
     if pred_w_j3d.ndim != 3 or pred_w_j3d.shape[0] != normalized_frames or pred_w_j3d.shape[-1] != 3:
         raise RuntimeError(
             "GVHMR 世界关节形状异常："
             f"expected ({normalized_frames}, J, 3), got {tuple(pred_w_j3d.shape)}"
         )
-    return {
-        "smpl_params_global": detach_to_cpu(pred["smpl_params_global"]),
+    contacts = _contact_confidence(pred, normalized_frames)
+    detached_global = detach_to_cpu(pred["smpl_params_global"])
+    detached_global = dict(detached_global)
+    pred_w_j3d, stabilized_transl, correction, ground_diagnostics = _stabilize_world_ground(
+        pred_w_j3d,
+        _numpy_array(detached_global["transl"]),
+        contacts,
+        fps=float(TARGET_FPS),
+        enabled=bool(options.get("ground_stabilization", True)),
+    )
+    detached_global["transl"] = stabilized_transl
+    portable = {
+        "smpl_params_global": detached_global,
         "smpl_params_incam": detach_to_cpu(pred["smpl_params_incam"]),
         "K_fullimg": detach_to_cpu(pred["K_fullimg"]),
-        "pred_w_j3d": pred_w_j3d.detach().cpu(),
+        "pred_w_j3d": pred_w_j3d,
+        "floor_correction_y": correction,
         "motiforge_video": {
             "protocol": PROTOCOL_VERSION,
             "source_path": item["source"],
@@ -315,8 +529,13 @@ def _portable_prediction(
             "focal_mm": options.get("focal_mm"),
             "mirror": bool(options.get("mirror", False)),
             "max_frames": options.get("max_frames"),
+            "ground_stabilization": ground_diagnostics,
         },
     }
+    if contacts is not None:
+        portable["left_contact_confidence"] = contacts[0]
+        portable["right_contact_confidence"] = contacts[1]
+    return portable
 
 
 def _portable_arrays(portable: dict[str, Any]) -> dict[str, np.ndarray]:

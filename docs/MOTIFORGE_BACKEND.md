@@ -50,9 +50,23 @@ python -m hmr4d.backends.motiforge run request.json response.json
 ```
 
 The portable prediction contains world body joints, global/in-camera SMPL-X
-parameters, camera intrinsics, source SHA-256, inference options, the GVHMR Git
+parameters, camera intrinsics, left/right foot-contact confidence, the applied
+world-Y floor correction, source SHA-256, inference options, the GVHMR Git
 revision and backend revision. Writes use temporary files followed by atomic
 replacement; one bad video does not abort the rest of a batch.
+
+The upstream static-camera postprocessor deliberately corrects only horizontal
+stationary-joint drift. The MotiForge backend additionally estimates the slow
+vertical floor component from sustained ankle/foot contacts predicted by the
+same checkpoint. Low-confidence flight frames are not floor anchors; the
+interpolated correction is applied equally to world joints and global SMPL
+translation, is capped at 0.25 m, and cannot push the lowest foot through the
+estimated floor. The correction is also limited to 0.2 m/s so a contact switch
+cannot create a one-frame root jump. MotiForge enables this behavior by default. Use
+`--gvhmr-no-ground-stabilization` on `motiforge video` to reproduce the raw
+upstream world-Y behavior. Robot sole clearance and collision grounding remain
+downstream retarget concerns, so Mink dataset generation should still use
+`--ground`.
 
 `simple_vo_workers=1` is the deterministic default. Higher values parallelize
 adjacent-frame matching but pycolmap RANSAC does not guarantee bitwise-identical
