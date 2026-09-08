@@ -367,9 +367,9 @@ def _stabilize_world_ground(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Remove slow vertical world drift between reliable static-foot anchors.
 
-    GVHMR's static-camera postprocessor intentionally leaves the world Y axis
-    untouched.  That is safe for visualization but lets a stationary support
-    foot drift vertically.  We use the model's own static-foot logits as floor
+    The upstream static-joint correction is horizontal-only; its separate
+    camera-root correction has a dead zone that can leave vertical drift.
+    We use the model's own static-foot logits as floor
     observations, interpolate the slow floor component through missing support,
     and apply the same correction to joints and SMPL translation.
     """
@@ -481,6 +481,169 @@ def _stabilize_world_ground(
     return world, root, correction, diagnostics
 
 
+def _static_camera_height_correction(
+    joints: np.ndarray,
+    transl: np.ndarray,
+    global_orient: np.ndarray,
+    incam: dict[str, Any] | None,
+    *,
+    fps: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Low-pass only the world/raw-camera height discrepancy, not the motion.
+
+    Use the same frame-zero camera rotation as ``pp_static_joint_cam``. A
+    vertical motion shared by both representations cancels before filtering,
+    so common jumps and squats do not become a camera correction.
+    """
+
+    if incam is None:
+        raise ValueError("incam parameters unavailable")
+    world = np.asarray(joints, dtype=np.float64)
+    frame_count = len(world)
+    if frame_count < 2 or not np.isfinite(fps) or fps <= 0:
+        raise ValueError("static camera height requires at least two frames and positive fps")
+    arrays = {}
+    for name, value in (
+        ("global.transl", transl),
+        ("global.global_orient", global_orient),
+        ("incam.transl", incam.get("transl")),
+        ("incam.global_orient", incam.get("global_orient")),
+    ):
+        array = np.asarray(_numpy_array(value), dtype=np.float64)
+        if array.shape != (frame_count, 3) or not np.all(np.isfinite(array)):
+            raise ValueError(f"{name} must be finite with shape ({frame_count}, 3)")
+        arrays[name] = array
+    if not np.all(np.isfinite(world)):
+        raise ValueError("world joints must be finite")
+
+    def rotation(axis_angle: np.ndarray) -> np.ndarray:
+        angle = float(np.linalg.norm(axis_angle))
+        if angle == 0.0:
+            return np.eye(3)
+        x, y, z = axis_angle / angle
+        skew = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+        return np.eye(3) + np.sin(angle) * skew + (1.0 - np.cos(angle)) * (skew @ skew)
+
+    camera_to_world = rotation(arrays["global.global_orient"][0]) @ rotation(
+        arrays["incam.global_orient"][0]
+    ).T
+    pelvis_offset = world[:, 0] - arrays["global.transl"]
+    camera_pelvis = pelvis_offset + arrays["incam.transl"]
+    reference = camera_pelvis @ camera_to_world.T
+    reference += world[0, 0] - reference[0]
+    discrepancy = world[:, 0, 1] - reference[:, 1]
+
+    # NumPy equivalent of Gaussian sigma=0.5s, truncate=4, nearest padding.
+    # Do not separately smooth incam: that would filter shared real motion.
+    sigma = 0.5 * fps
+    radius = int(4.0 * sigma + 0.5)
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    weights = np.exp(-0.5 * (offsets / sigma) ** 2)
+    weights /= weights.sum()
+    correction = np.convolve(
+        np.pad(discrepancy, (radius, radius), mode="edge"), weights, mode="valid"
+    )
+    correction -= correction[0]
+    return correction, {
+        "version": "raw-static-incam-height-v1",
+        "applied": bool(np.any(correction != 0.0)),
+        "reference": "frame_zero_camera_to_world",
+        "camera_to_world_rotation": camera_to_world.tolist(),
+        "discrepancy_gaussian_sigma_seconds": 0.5,
+        "incam_prefilter": "none",
+        "max_abs_correction_m": float(np.max(np.abs(correction))),
+        "p95_abs_correction_m": float(np.percentile(np.abs(correction), 95.0)),
+    }
+
+
+def _stabilize_prediction_ground(
+    joints: np.ndarray,
+    transl: np.ndarray,
+    contacts: tuple[np.ndarray, np.ndarray] | None,
+    *,
+    global_orient: np.ndarray,
+    incam: dict[str, Any] | None,
+    fps: float,
+    enabled: bool,
+    static_camera: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Compose static-camera height and legacy floor corrections in source Y.
+
+    Dynamic cameras, disabled stabilization and missing support keep the exact
+    legacy numerical path. Invalid camera parameters also fall back explicitly.
+    The single exported correction is applied once to the original prediction
+    and its *total* speed, not just each stage's speed, is bounded at 0.2 m/s.
+    """
+
+    legacy = _stabilize_world_ground(joints, transl, contacts, fps=fps, enabled=enabled)
+    if not enabled or not static_camera:
+        return legacy
+    if legacy[3].get("reason") in {"contact_confidence_unavailable", "insufficient_contact"}:
+        legacy[3]["camera_stage"] = {"applied": False, "reason": legacy[3]["reason"]}
+        return legacy
+    try:
+        camera_correction, camera_diagnostics = _static_camera_height_correction(
+            joints, transl, global_orient, incam, fps=fps
+        )
+    except (TypeError, ValueError, AttributeError) as exc:
+        legacy[3]["camera_stage"] = {
+            "applied": False,
+            "reason": "invalid_or_missing_incam_parameters",
+            "detail": str(exc),
+        }
+        return legacy
+
+    camera_world = np.asarray(joints, dtype=np.float64).copy()
+    camera_root = np.asarray(transl, dtype=np.float64).copy()
+    camera_world[:, :, 1] -= camera_correction[:, None]
+    camera_root[:, 1] -= camera_correction
+    _, _, floor_correction, floor_diagnostics = _stabilize_world_ground(
+        camera_world, camera_root, contacts, fps=fps, enabled=True
+    )
+    desired_total = camera_correction + floor_correction
+    correction = _lipschitz_minorant(desired_total, _MAX_GROUND_SPEED_MPS / fps).astype(
+        np.float32
+    )
+    world = np.asarray(joints, dtype=np.float32).copy()
+    root = np.asarray(transl, dtype=np.float32).copy()
+    world[:, :, 1] -= correction[:, None]
+    root[:, 1] -= correction
+
+    minimum_run = max(2, round(fps * 0.10))
+    left_contact, right_contact = (
+        _remove_short_runs(confidence >= _CONTACT_THRESHOLD, minimum_run)
+        for confidence in contacts
+    )
+    left_y = np.minimum(world[:, 7, 1], world[:, 10, 1])
+    right_y = np.minimum(world[:, 8, 1], world[:, 11, 1])
+    support_y = np.minimum(
+        np.where(left_contact, left_y, np.inf), np.where(right_contact, right_y, np.inf)
+    )[left_contact | right_contact]
+    target_height = floor_diagnostics["target_foot_height_m"]
+    diagnostics = {
+        "version": "static-camera-contact-floor-v2",
+        "enabled": True,
+        "applied": bool(np.any(correction != 0.0)),
+        "contact_threshold": _CONTACT_THRESHOLD,
+        "contact_frames": floor_diagnostics["contact_frames"],
+        "static_support_missing_frames": floor_diagnostics["static_support_missing_frames"],
+        "flight_frames": floor_diagnostics["flight_frames"],  # Deprecated alias, not flight.
+        "camera_stage": camera_diagnostics,
+        "floor_stage": floor_diagnostics,
+        "correction_composition": "camera_plus_floor_then_lipschitz_minorant",
+        "total_speed_limit_mps": _MAX_GROUND_SPEED_MPS,
+        "total_projection_max_change_m": float(np.max(np.abs(correction - desired_total))),
+        "target_foot_height_m": target_height,
+        "max_abs_correction_m": float(np.max(np.abs(correction))),
+        "p95_abs_correction_m": float(np.percentile(np.abs(correction), 95.0)),
+        "contact_height_p95_error_m": float(
+            np.percentile(np.abs(support_y - target_height), 95.0)
+        ),
+        "max_correction_speed_mps": float(np.max(np.abs(np.diff(correction))) * fps),
+    }
+    return world, root, correction, diagnostics
+
+
 def _portable_prediction(
     *,
     pred,
@@ -503,17 +666,21 @@ def _portable_prediction(
     contacts = _contact_confidence(pred, normalized_frames)
     detached_global = detach_to_cpu(pred["smpl_params_global"])
     detached_global = dict(detached_global)
-    pred_w_j3d, stabilized_transl, correction, ground_diagnostics = _stabilize_world_ground(
+    detached_incam = detach_to_cpu(pred.get("smpl_params_incam", {}))
+    pred_w_j3d, stabilized_transl, correction, ground_diagnostics = _stabilize_prediction_ground(
         pred_w_j3d,
         _numpy_array(detached_global["transl"]),
         contacts,
+        global_orient=_numpy_array(detached_global["global_orient"]),
+        incam=detached_incam,
         fps=float(TARGET_FPS),
         enabled=bool(options.get("ground_stabilization", True)),
+        static_camera=bool(options.get("static_camera", False)),
     )
     detached_global["transl"] = stabilized_transl
     portable = {
         "smpl_params_global": detached_global,
-        "smpl_params_incam": detach_to_cpu(pred["smpl_params_incam"]),
+        "smpl_params_incam": detached_incam,
         "K_fullimg": detach_to_cpu(pred["K_fullimg"]),
         "pred_w_j3d": pred_w_j3d,
         "floor_correction_y": correction,

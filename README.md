@@ -46,9 +46,12 @@ The versioned `hmr4d.backends.motiforge` entry point lets the sibling MotiForge
 project orchestrate headless GVHMR inference without sharing Python environments
 or vendoring this code. Setup, runtime checks and the portable artifact contract
 are documented in [docs/MOTIFORGE_BACKEND.md](docs/MOTIFORGE_BACKEND.md). The
-backend also exports the checkpoint's foot-contact confidence and uses sustained
-contacts to remove slow vertical world-floor drift while preserving predicted
-flight; this source correction can be disabled from MotiForge for ablation.
+backend also exports the checkpoint's static-foot confidence and uses sustained
+support to estimate vertical world-floor drift. For a fixed camera it first
+corrects the low-frequency world/raw-in-camera height discrepancy, then limits
+the combined source-Y correction to 0.2 m/s. Shared camera/world jumps and squats
+cancel before the discrepancy filter; missing static support is not a flight
+label. This source correction can be disabled from MotiForge for ablation.
 
 ### Reproduce
 1. **Test**:

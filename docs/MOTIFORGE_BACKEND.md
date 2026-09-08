@@ -55,15 +55,45 @@ world-Y floor correction, source SHA-256, inference options, the GVHMR Git
 revision and backend revision. Writes use temporary files followed by atomic
 replacement; one bad video does not abort the rest of a batch.
 
-The upstream static-camera postprocessor deliberately corrects only horizontal
-stationary-joint drift. The MotiForge backend additionally estimates the slow
-vertical floor component from sustained ankle/foot contacts predicted by the
-same checkpoint. Frames without confident static support are not floor anchors;
-low static probability can also mean sliding contact or fast steps, not flight. The
-interpolated correction is applied equally to world joints and global SMPL
-translation, is capped at 0.25 m, and cannot push the lowest foot through the
-estimated floor. The correction is also limited to 0.2 m/s so a contact switch
-cannot create a one-frame root jump. MotiForge enables this behavior by default. Use
+The upstream static-camera postprocessor includes an XYZ camera-root correction
+with a 0.25 m discrepancy dead zone, followed by a horizontal-only static-joint
+correction. It does not leave Y entirely untouched, but residual height drift
+inside the camera dead zone can remain.
+
+The backend's legacy `contact-floor-v1` estimates the slow floor component from
+sustained ankle/foot static probabilities predicted by the same checkpoint.
+Frames without confident static support are not floor anchors: low static
+probability can also mean sliding contact or fast steps, not flight. Its desired
+interpolated floor correction is clipped to +/-0.25 m before a joint-height
+ceiling and a 0.2 m/s rate constraint are applied. This is not mesh-sole collision
+grounding.
+
+Only when both `static_camera` and `ground_stabilization` are enabled, the backend
+uses `static-camera-contact-floor-v2`: reconstruct the raw in-camera pelvis,
+map it with the original frame-zero camera-to-world rotation, and Gaussian-filter
+only the world-minus-camera Y discrepancy with sigma=0.5 seconds (nearest edge
+padding, truncate=4). The camera translation is not independently smoothed, so
+real vertical motion shared by both representations cancels before filtering.
+The first camera correction sample is subtracted to retain the original initial
+height gauge. The existing floor algorithm then runs on this camera-corrected
+prediction. Camera and floor corrections are summed and jointly projected through
+the same 0.2 m/s Lipschitz minorant, preventing two individually bounded stages
+from exceeding the total speed limit. The total correction is not subject to a
+separate 0.25 m amplitude cap. Exactly the same exported `floor_correction_y` is
+subtracted once from the original world-joint Y and global SMPL translation Y;
+XZ, root-relative pose, in-camera parameters and source confidence are unchanged
+apart from float32 rounding. This does not hard-snap each frame to the floor.
+
+Dynamic cameras and disabled stabilization retain the exact legacy numerical
+path. Missing or insufficient static support also retains the legacy fallback.
+Missing, malformed or nonfinite in-camera parameters fall back with an explicit
+`camera_stage.reason` and `detail`; they are not silently treated as reliable
+camera evidence. Top-level ground diagnostics describe the final total
+correction, final support-height p95 error and final speed, while `camera_stage`
+and `floor_stage` describe their individual stages. In particular a floor stage
+below its 5 mm threshold can still produce an applied camera-only total.
+
+MotiForge enables source ground stabilization by default. Use
 `--gvhmr-no-ground-stabilization` on `motiforge video` to reproduce the raw
 upstream world-Y behavior. Robot sole clearance and collision grounding remain
 downstream retarget concerns, so Mink dataset generation should still use
@@ -71,9 +101,10 @@ downstream retarget concerns, so Mink dataset generation should still use
 
 `ground_stabilization.static_support_missing_frames` counts frames without a
 retained static-foot anchor. The old `flight_frames` key remains as a deprecated
-alias with exactly the same value; it is not a flight classification. This naming
-clarification does not change the `contact-floor-v1` numerical algorithm or the
-protocol-3 format.
+alias with exactly the same value; it is not a flight classification. The legacy
+`contact-floor-v1` numerical helper and protocol-3 format remain unchanged. The
+backend file's content revision invalidates caches when this source algorithm
+changes; no retarget-engine options enter this source artifact identity.
 
 ## Optional foot-surface evidence from an existing prediction
 
