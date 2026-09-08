@@ -53,6 +53,19 @@ the combined source-Y correction to 0.2 m/s. Shared camera/world jumps and squat
 cancel before the discrepancy filter; missing static support is not a flight
 label. This source correction can be disabled from MotiForge for ablation.
 
+Existing portable predictions can be explicitly augmented with geometric foot
+surfaces (`export-foot-surface`) or validated world-space body22 rotations and a
+shaped neutral bind (`export-body-pose`). These CPU-only commands preserve the
+original motion and do not rerun perception or change default video exports.
+The body-pose export rejects dynamic shape and validates SMPL-X FK and serialized
+rotation/bind compatibility within 0.1 mm before publishing a new artifact.
+It remains an explicit A/B experiment, not default inference or a demonstrated
+overall quality improvement: full-clip tests improved tracking/orientation but
+increased foot sliding, with physical quality still C. The Feishu Adam Lite test
+also increased self-collision; tennis G1 retained 16/313 floating frames. These
+results do not establish that floating feet are solved; detailed measurements
+are recorded in the backend documentation linked above.
+
 ### Reproduce
 1. **Test**:
 To reproduce the 3DPW, RICH, and EMDB results in a single run, use the following command:

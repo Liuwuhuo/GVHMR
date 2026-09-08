@@ -140,7 +140,9 @@ body22 joints agree with the portable `fk_v2` result within 0.1 mm before publis
 - `schema: "smplx-foot-surface-v1"`, `foot_order: ["left", "right"]`;
 - `up_axis: "y"`, `units: "m"`;
 - `body_model_sha256`, `vertex_counts`, and the full `exporter_sha256` of
-  `hmr4d/backends/foot_surface.py`.
+  `hmr4d/backends/foot_surface.py`;
+- `helper_sha256`, covering the shared portable validation/publication/model
+  loader and existing `BodyModelSMPLX` wrapper implementations.
 
 `motiforge_video.foot_surface_export` records the input artifact path/content
 SHA-256, its prior backend revision, the export backend revision, and the maximum
@@ -157,6 +159,81 @@ ground correction**. It can represent real flight and retained source height
 error. Robot collision clearance, target-height policy, and quality evaluation
 remain downstream concerns. Neither per-frame hard grounding nor the diagnostic
 gap-floor heuristic is part of this command.
+
+## Optional body22 pose evidence from an existing prediction
+
+To preserve explicit SMPL-X body orientation for downstream pose-aware A/B tests,
+augment a completed portable NPZ in the isolated GVHMR environment:
+
+```bash
+PYTHONNOUSERSITE=1 python -m hmr4d.backends.motiforge export-body-pose \
+  /path/to/completed-prediction.npz \
+  --output /path/to/prediction-with-body-pose.npz \
+  --asset-root /path/to/gvhmr-assets
+```
+
+This is **explicit A/B evidence, not default inference**, and has not demonstrated
+an overall quality improvement. Full-clip comparisons on 2026-09-08, with the
+same source positions/height and Mink + Ground, exposed the following tradeoffs:
+
+- Feishu / Adam Lite: tracking p95 improved from 67.250 to 62.853 mm and
+  orientation p95 from 28.358 to 22.140 degrees, but foot sliding increased from
+  40.009 to 57.548 mm/s and the self-collision metric from 35.354 to 50.547 mm.
+  Physical quality remained C.
+- Tennis / G1: tracking p95 improved from 60.868 to 57.808 mm and fidelity from B
+  to A, but foot sliding increased from 152.776 to 193.053 mm/s. Floating frames
+  remained 16/313 in both runs, and physical quality remained C.
+
+Consequently, pose export remains opt-in for comparisons; better tracking or
+fidelity alone does not establish better overall motion quality. These tests do
+not demonstrate that floating feet are solved.
+
+This uses the existing CPU SMPL-X/PyTorch runtime and the same neutral model asset
+as the foot-surface exporter. It does not run video preprocessing, inference,
+upstream postprocessing, ground correction or retargeting. No new dependency or
+default video option is introduced. It preserves every pre-existing array,
+including world joints, global/in-camera parameters, floor correction, contacts
+and any `foot_surface_y`, and adds only:
+
+- `body22_world_rotations: float32[T, 22, 4]`: world-space **wxyz** unit quaternions;
+- `body22_bind_positions: float32[22, 3]`: shaped neutral global positions in Y-up metres;
+- `body22_bind_rotations: float32[22, 4]`: global identity **wxyz** quaternions,
+  since SMPL zero local body pose uses identity joint frames.
+
+The body22 order is pelvis, left/right hip, spine1, left/right knee, spine2,
+left/right ankle, spine3, left/right foot, neck, left/right collar, head,
+left/right shoulder, left/right elbow and left/right wrist. Its parents are
+`[-1,0,0,0,1,2,3,4,5,6,7,8,9,9,9,12,13,14,16,17,18,19]`.
+No fingers or inferred end joints are added. The shaped neutral bind includes
+the model's pelvis offset; it is not the first frame of the motion.
+
+Before publication, the exporter requires **exactly constant per-frame betas**;
+even a small dynamic shape change is rejected rather than silently collapsed
+into one bind. It verifies the model parent chain, the neutral model against its
+shaped skeleton, and every pose against the portable body22 world joints using
+both full-model FK and SMPL-X's rigid parent-chain transforms. Each maximum
+Euclidean joint error must be at most **0.1 mm**. The final float32 quaternions
+and bind positions must also reconstruct the observed bone directions and joint
+positions within that tolerance, using parent world rotations on neutral bone
+offsets. Model work uses CPU `torch.no_grad()` chunks of at most 64 frames.
+
+`motiforge_video.body_pose` records `schema: "smplx-body22-pose-v1"`, `up_axis: "y"`,
+`units: "m"`, `quaternion_order: "wxyz"`, `joint_names`, `parents`,
+`body_model_sha256`, the full `exporter_sha256` of `hmr4d/backends/body_pose.py`,
+`helper_sha256`, `body22_max_error_m`, and `bind_reconstruction_max_error_m`.
+`motiforge_video.body_pose_export` records the input artifact's exact bytes SHA,
+path, parent backend revision and export backend revision. The original video
+SHA, source path, inference options and ground diagnostics remain unchanged;
+the top-level backend revision is updated to identify the export entry point.
+
+Input/output must be different files. Existing outputs (including publication
+races), malformed/nonfinite data, pickle-dependent arrays, missing model assets,
+existing body-pose evidence and incompatible geometry are rejected without
+replacing any artifact. Both optional exporters share neutral portable I/O and
+record those helper hashes; neither imports the other's geometry algorithm.
+Optional module changes do not become hidden dependencies of default inference:
+the backend retains its original single-file revision contract, while explicit
+evidence records the additional implementation identities.
 
 `simple_vo_workers=1` is the deterministic default. Higher values parallelize
 adjacent-frame matching but pycolmap RANSAC does not guarantee bitwise-identical

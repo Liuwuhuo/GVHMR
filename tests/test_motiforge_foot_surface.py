@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 import hmr4d.backends.foot_surface as foot_surface_module
+import hmr4d.backends.portable as portable_module
 from hmr4d.backends.foot_surface import export_foot_surface
 
 _MODEL_RELATIVE_PATH = "inputs/checkpoints/body_models/smplx/SMPLX_NEUTRAL.npz"
@@ -170,6 +171,7 @@ class FootSurfaceExportTests(unittest.TestCase):
             hashlib.sha256(Path(foot_surface_module.__file__).read_bytes()).hexdigest(),
         )
         self.assertEqual(metadata["gvhmr_backend_revision"], _BACKEND_ID)
+        self.assertEqual(surface["helper_sha256"], portable_module._helper_sha256())
         identity = metadata["foot_surface_export"]
         self.assertEqual(identity["source_artifact"], str(self.input_path.resolve()))
         self.assertEqual(identity["source_artifact_sha256"], input_sha)

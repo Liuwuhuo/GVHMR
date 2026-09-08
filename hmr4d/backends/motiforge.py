@@ -899,6 +899,21 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["doctor"]:
         return _doctor_command(argv[1:])
+    if argv[:1] == ["export-body-pose"]:
+        parser = argparse.ArgumentParser(description="Add validated SMPL-X body22 pose evidence to a new portable NPZ")
+        parser.add_argument("input", type=Path)
+        parser.add_argument("--output", required=True, type=Path)
+        parser.add_argument("--asset-root", required=True, type=Path)
+        args = parser.parse_args(argv[1:])
+        from hmr4d.backends.body_pose import export_body_pose
+
+        try:
+            report = export_body_pose(args.input, args.output, args.asset_root, backend_id=backend_revision())
+        except Exception as exc:  # noqa: BLE001 - explicit process-boundary diagnostic
+            print(f"body-pose export failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
     if argv[:1] == ["export-foot-surface"]:
         parser = argparse.ArgumentParser(description="Add optional SMPL-X foot-surface evidence to a new portable NPZ")
         parser.add_argument("input", type=Path)
@@ -919,7 +934,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "usage: python -m hmr4d.backends.motiforge "
         "doctor --asset-root DIR | run REQUEST_JSON RESPONSE_JSON | "
-        "export-foot-surface INPUT --output OUTPUT --asset-root DIR",
+        "export-foot-surface INPUT --output OUTPUT --asset-root DIR | "
+        "export-body-pose INPUT --output OUTPUT --asset-root DIR",
         file=sys.stderr,
     )
     return 2
