@@ -89,6 +89,11 @@ class MotiForgeBackendTests(unittest.TestCase):
         self.assertEqual(metadata["gvhmr_backend_revision"], "backend-revision")
         self.assertEqual(metadata["simple_vo_workers"], 4)
         self.assertEqual(metadata["ground_stabilization"]["version"], "contact-floor-v1")
+        self.assertNotIn("foot_surface_y", portable)
+        self.assertEqual(
+            metadata["ground_stabilization"]["static_support_missing_frames"],
+            metadata["ground_stabilization"]["flight_frames"],
+        )
 
     def test_ground_stabilization_removes_floor_drift_but_preserves_flight(self) -> None:
         import numpy as np

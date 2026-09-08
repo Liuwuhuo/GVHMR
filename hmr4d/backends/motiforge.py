@@ -365,12 +365,12 @@ def _stabilize_world_ground(
     fps: float,
     enabled: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    """Remove slow vertical world drift while preserving predicted flight.
+    """Remove slow vertical world drift between reliable static-foot anchors.
 
     GVHMR's static-camera postprocessor intentionally leaves the world Y axis
     untouched.  That is safe for visualization but lets a stationary support
     foot drift vertically.  We use the model's own static-foot logits as floor
-    observations, interpolate only the slow floor component through flight,
+    observations, interpolate the slow floor component through missing support,
     and apply the same correction to joints and SMPL translation.
     """
 
@@ -401,6 +401,8 @@ def _stabilize_world_ground(
                 "left": int(left_contact.sum()),
                 "right": int(right_contact.sum()),
             },
+            "static_support_missing_frames": int((~support).sum()),
+            # Deprecated compatibility alias: low static probability is not flight.
             "flight_frames": int((~support).sum()),
         }
     )
@@ -730,11 +732,27 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["doctor"]:
         return _doctor_command(argv[1:])
+    if argv[:1] == ["export-foot-surface"]:
+        parser = argparse.ArgumentParser(description="Add optional SMPL-X foot-surface evidence to a new portable NPZ")
+        parser.add_argument("input", type=Path)
+        parser.add_argument("--output", required=True, type=Path)
+        parser.add_argument("--asset-root", required=True, type=Path)
+        args = parser.parse_args(argv[1:])
+        from hmr4d.backends.foot_surface import export_foot_surface
+
+        try:
+            report = export_foot_surface(args.input, args.output, args.asset_root, backend_id=backend_revision())
+        except Exception as exc:  # noqa: BLE001 - explicit process-boundary diagnostic
+            print(f"foot-surface export failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
     if len(argv) == 3 and argv[0] == "run":
         return run_request(Path(argv[1]), Path(argv[2]))
     print(
         "usage: python -m hmr4d.backends.motiforge "
-        "doctor --asset-root DIR | run REQUEST_JSON RESPONSE_JSON",
+        "doctor --asset-root DIR | run REQUEST_JSON RESPONSE_JSON | "
+        "export-foot-surface INPUT --output OUTPUT --asset-root DIR",
         file=sys.stderr,
     )
     return 2
