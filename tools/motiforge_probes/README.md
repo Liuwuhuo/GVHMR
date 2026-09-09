@@ -1,6 +1,7 @@
-# 视频支撑短窗诊断（非生产默认）
+# 视频源与支撑短窗诊断（非生产默认）
 
-这是 2026-09-08 飞书固定机位案例的受控实验。三个脚本仅在隔离 GVHMR Python 中运行，
+本目录仅在隔离 GVHMR Python 中运行，不是产品自动后处理。以下第一组是
+2026-09-08 飞书固定机位案例的受控实验；该组三个脚本
 没有被 backend、安装入口或 MotiForge core 导入，不改变普通视频推理。受试视频 SHA-256
 为 `80fa6378001d92df61459105ef59cb2043d5c4c141ce71a383d7bd0cf0827f1f`，2834 帧、30 Hz。
 脚本拒绝其他视频身份：人工帧标注不能直接迁移到其他输入。
@@ -71,3 +72,68 @@ Adam Lite 的两支持窗足底点最大 XY 漂移从约 70.4/90.2 mm 降到 7.0
 
 下一步应自动获得可靠的前掌/滚足/未知支撑证据，增加窗口边界与非接触区域的保持约束，
 并回归不同视频；不能通过降低公共质量门槛或将所有脚强压地来验收。
+
+## 2026-09-09：高度消融、背部支撑与相机一致性
+
+下面三个独立脚本不绑定飞书案例，也不被生产流程导入。输入仍需是本 backend 的静态、
+未镜像 portable artifact；所有输出拒绝覆盖原件，模型/视频/关键点不随源码分发。
+
+### 拆开已有高度修正
+
+```bash
+python tools/motiforge_probes/ablate_source.py \
+  --source "case-name=$PLAIN_PORTABLE" \
+  --asset-root "$ASSET_ROOT" --output-root "$NEW_EXPERIMENT_DIR"
+```
+
+从原 plain position-only portable 的 world Y + floor_correction_y 重建 native，再分别运行
+camera-only、floor-only，输出 plain/inputs 两层及报告。native 仍包括原生 GVHMR 后处理，
+不是 raw network 输出。先重跑 combined 校正并要求误差 <1e-5 m；只允许 Y 平移，pose、
+incam、confidence、水平坐标保持。脚底必须重新经过完整 SMPL-X 导出，不平移旧证据冒充重算。
+五条站立/走停/跳跃/快速换步/躺起，共 20 组同参数对照，最大重建误差 <1.20e-7 m。
+统一关闭修正导致走停浮起和躺起穿地/跳变，不作为修复方案。
+
+### 人工双背部支撑（两个失败候选，仅供复现）
+
+```bash
+python tools/motiforge_probes/fit_back_support.py \
+  --input "$SURFACE_PORTABLE" --keypoints "$KEYPOINTS" --model "$MODEL" \
+  --window-start 12 --window-end 17 --support-start 14 --support-end 15.5 \
+  --iterations 120 --surface-penalty mean --device cuda --output "$NEW_MEAN_NPZ"
+```
+
+以上时间只对应男性躺起开发片段，不能原样当其他视频标签。另一个候选**只**将
+`--surface-penalty` 改为 `worst-frame`、使用另一输出文件；其余参数和权重不变。
+女性留出原视频先独立确认支撑 [6.5,7.5) s，优化 [4.5,9.5) s，没有按模型结果修改标签。
+
+- 人工确认原首帧站立、支撑窗骨盆后侧与胸背确实接地。plane 取原首帧脚面，R/T 取原首帧
+  global/incam 根关系，K 和 shape 固定；它们是估计 gauge，不是实测相机/地面标定。
+- shaped-neutral 空间按 skinning 权重及后方选两个静态材料 patch，先验证 +Y 躯干、+Z
+  toe-forward、patch 后向/不重叠。只优化根和髋/膝/脊柱，不改变 toe/shape/原输入。
+- 根平移范数 ≤0.65 m，根旋转每轴 ≤45°、局部每轴 ≤20°，**并非总旋转角 45°/20°**。
+  目标为真实 COCO12、背部贴地、抽样全身+完整手脚非穿地、先验和平滑。ViTPose heatmap
+  峰值不保证 ≤1；只把优化权重裁到 [0,1] 平方，观测本身不改。
+- 0.5 s sin² 窗口过渡，窗口外和边界帧逐值恢复。序列化后全时间线 SMPL-X FK/脚面检查，
+  独立完整 mesh 穿透评估；拒绝已有 body22 姿态证据，避免保留陈旧旋转。
+- 原 incam/confidence/floor_correction_y 是旧推理证据；新几何证据写入
+  `experimental_back_support_fit`。旧 foot_surface_export 是祖先记录，不是本次计算身份。
+- 男性开发片段支撑重投影 p95 84.80→135.84/121.70 px，全 mesh 最大穿地
+  70.19→259.00/147.36 mm。均方会稀释局部深穿透，逐帧最深惩罚减轻它却仍不能验收。
+  两版都不接入自动流程；贴地或某个中位数下降不能证明动作恢复正确。
+
+### 只读 world/incam 审计
+
+```bash
+python tools/motiforge_probes/camera_consistency.py \
+  --input "$SURFACE_PORTABLE" --keypoints "$KEYPOINTS" --model "$MODEL" \
+  --start 14 --end 15.5 --output "$NEW_AUDIT_JSON"
+```
+
+始终 CPU、不拟合任何变量，完整 FK 验证后，在同一实际 2D mask 比较原 incam 直接投影与
+现 world 经首帧固定外参的投影，记录每帧隐含旋转偏差。男性支撑窗两者 p95 13.91/84.80 px，
+提示固定相机下世界恢复与相机观测仍不一致。旋转偏差不是实测 camera motion；2D detector
+不是 mocap 真值，首帧一致也不证明整段 gravity/extrinsic 正确。
+
+新一轮仍先定位 incam/world 和重力/地面参考，再做下一轮有限候选，不继续增加本轮接触权重。
+完整输入身份、固定参数、机器人统一门禁与留出结果维护在 MotiForge 的
+`docs/video_source_comparison.md`。本目录不含训练新模型或机器人动力学后处理。
