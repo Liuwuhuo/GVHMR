@@ -12,6 +12,11 @@ request/response protocol.
 
 ## Runtime check
 
+`python -m hmr4d.backends.motiforge capabilities` provides lightweight protocol,
+mode and implementation identity negotiation without importing Torch or loading
+checkpoints. Default source identity covers the adapter and its observation
+stability helper; a helper change must not reuse an older prediction cache.
+
 Prepare the upstream checkpoints described in `docs/INSTALL.md`, then run:
 
 ```bash
@@ -106,6 +111,45 @@ alias with exactly the same value; it is not a flight classification. The legacy
 backend file's content revision invalidates caches when this source algorithm
 changes; no retarget-engine options enter this source artifact identity.
 
+## Observation stability (2026-09-11)
+
+The optional request field `options.observation_stability` defaults to `audit`:
+
+- `off`: skip the new observation/final-human audit and repair.
+- `audit`: preserve the exact model input and numerical export, append advisory
+  visibility, boundary/truncation and temporal-spike evidence only.
+- `conservative`: additionally bridge short, asymmetric opposite-side elbow/wrist
+  collapses with reliable endpoints, using the previously validated fixed rule.
+  Scores are never increased; only effective visible-coordinate changes replace
+  model input. The original native bbox/ViT cache is retained unchanged.
+
+The NumPy-only `backends/observation_stability.py` owns the numerical policy.
+The adapter calls `_prepare_observation_data` before the single normal model
+prediction and `_finish_observation_stability` after portable geometry export.
+No robot, retarget, contact/height, network-weight or global smoothing change is
+part of this stage. `audit` is not a physical quality gate. A large velocity alone
+does not establish an invalid action, and an interpolated coordinate is a
+hypothesis, not a recovered observation. Changed inputs may affect the whole clip.
+
+`observation_stability.json` next to the human cache and
+`motiforge_video.observation_stability` store the same schema-version-1 report,
+including inclusive source-frame intervals at 30 Hz, unchanged native score
+semantics, accepted repair coordinates and diagnostic thresholds. Original detector
+presence/identity are unknown in existing smoothed-bbox caches, not fabricated.
+No automatic clipping, boundary filling, motion freezing or silent rejection is
+performed. All frames remain available for inspection and downstream evaluation.
+
+The MotiForge CLI option is `--gvhmr-observation-stability`; Web exposes the same
+three modes. Mode enters the source cache key. Old protocol-3 portable artifacts
+remain readable, but do not acquire audit evidence retroactively. Multi-person
+output is not added: the 2D tracker selects the largest accumulated-area track and
+only that person enters the SMPL-X model. Independent per-track reconstruction and
+shared-world identity/interaction consistency require separate work.
+
+Regression evidence is maintained in sibling MotiForge's
+`docs/regression_baseline.md`, with full35 cached-video and fixed Mink comparisons
+under its ignored `out/gvhmr-stability-20260911/` directory.
+
 ## Optional foot-surface evidence from an existing prediction
 
 The default video inference export remains unchanged: it does not reconstruct a
@@ -148,9 +192,9 @@ body22 joints agree with the portable `fk_v2` result within 0.1 mm before publis
 SHA-256, its prior backend revision, the export backend revision, and the maximum
 body22 consistency error. The top-level backend revision is updated while the
 original video `source_path`, `source_sha256`, inference revision/options, and
-floor diagnostics are preserved. `backend_revision()` retains its original
-single-file identity for default video-cache compatibility; the optional exporter
-has its own recorded content SHA. This is additive protocol-3 evidence: old
+floor diagnostics are preserved. `backend_revision()` covers the default adapter
+and observation stability helper; the optional exporter has its own recorded
+content SHA. This is additive protocol-3 evidence: old
 artifacts remain valid and downstream surface-height use must be explicitly
 enabled.
 
@@ -232,8 +276,8 @@ existing body-pose evidence and incompatible geometry are rejected without
 replacing any artifact. Both optional exporters share neutral portable I/O and
 record those helper hashes; neither imports the other's geometry algorithm.
 Optional module changes do not become hidden dependencies of default inference:
-the backend retains its original single-file revision contract, while explicit
-evidence records the additional implementation identities.
+the default identity covers the adapter/stability module only, while explicit
+evidence records the additional exporter implementation identities.
 
 `simple_vo_workers=1` is the deterministic default. Higher values parallelize
 adjacent-frame matching but pycolmap RANSAC does not guarantee bitwise-identical

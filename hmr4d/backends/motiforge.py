@@ -52,6 +52,7 @@ _STATIC_JOINT_IDS = (7, 10, 8, 11)
 _CONTACT_THRESHOLD = 0.8
 _MAX_GROUND_CORRECTION_M = 0.25
 _MAX_GROUND_SPEED_MPS = 0.20
+OBSERVATION_STABILITY_MODES = ("off", "audit", "conservative")
 
 
 def _sha256(path: Path) -> str:
@@ -65,7 +66,12 @@ def _sha256(path: Path) -> str:
 def backend_revision() -> str:
     """Return an identity for the protocol implementation itself."""
 
-    return _sha256(Path(__file__).resolve())[:12]
+    # Both files affect cached predictions/diagnostics. Do not key only this adapter.
+    digest = hashlib.sha256()
+    for path in (Path(__file__).resolve(), Path(__file__).with_name("observation_stability.py")):
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
 
 
 def project_revision() -> str:
@@ -233,6 +239,7 @@ def diagnose(
         "asset_root": str(asset_root),
         "gvhmr_revision": project_revision(),
         "backend_revision": backend_revision(),
+        "capabilities": {"observation_stability": list(OBSERVATION_STABILITY_MODES)},
         "ok": not errors,
         "checks": checks,
         "errors": [f"{item['name']}: {item['detail']}" for item in errors],
@@ -741,6 +748,88 @@ def _write_portable_npz(path: Path, portable: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _prepare_observation_data(data, mode="audit", *, image_size=None, boxes=None):
+    """Audit raw observations; optionally repair only the validated short-gap policy.
+
+    The native preprocess cache is never changed. Audit and no-effective-hit
+    paths return the original model input object, not a resampled/smoothed copy.
+    Scores retain their native meaning (visibility > 0.5, not probability).
+    """
+    if mode not in OBSERVATION_STABILITY_MODES:
+        raise ValueError(f"Unknown observation_stability mode: {mode!r}")
+    if mode == "off":
+        return data, None
+    from hmr4d.backends.observation_stability import (
+        POLICY,
+        audit_observations,
+        detect_and_repair,
+    )
+
+    original = _numpy_array(data["kp2d"])
+    crops = _numpy_array(data["bbx_xys"])
+    if crops.shape != (len(original), 3) or not np.isfinite(crops).all():
+        raise ValueError("bbx_xys must be finite shape (T, 3)")
+    crop_scale = crops[:, 2]
+    observations = audit_observations(
+        original, crop_scale, float(TARGET_FPS), image_size=image_size, boxes=boxes,
+    )
+    report = {
+        "schema_version": 1,
+        "mode": mode,
+        "observation_audit": observations,
+        "warnings": list(observations["warnings"]),
+        "timeline_policy": "preserve_all_frames; no automatic trimming or gap filling",
+        "tracking_evidence": "selected smoothed bbox only; raw detector presence and identity unknown",
+    }
+    if mode == "conservative":
+        candidate, accepted, rejected = detect_and_repair(original, crop_scale, float(TARGET_FPS))
+        changed = np.any(candidate[..., :2] != original[..., :2], axis=-1)
+        # normalize_kp2d also masks points outside the crop. A visible-to-
+        # invisible transition still changes the model input; two invisible
+        # positions do not. Match the upstream inclusive crop boundaries.
+        lower = crops[:, None, :2] - crop_scale[:, None, None] / 2
+        upper = crops[:, None, :2] + crop_scale[:, None, None] / 2
+        original_inside = np.all((original[..., :2] >= lower) & (original[..., :2] <= upper), axis=-1)
+        candidate_inside = np.all((candidate[..., :2] >= lower) & (candidate[..., :2] <= upper), axis=-1)
+        effective = changed & (original[..., 2] > 0.5) & (original_inside | candidate_inside)
+        rejection_counts: dict[str, int] = {}
+        for entry in rejected:
+            for reason in entry["rejection_reasons"]:
+                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+        report["keypoint_repair"] = {
+            "policy": POLICY,
+            "accepted": accepted,
+            "rejected_run_count": len(rejected),
+            "rejection_reason_counts": rejection_counts,
+            "candidate_joint_frames": int(changed.sum()),
+            "visible_changed_joint_frames": int(effective.sum()),
+            "applied_joint_frames": int(changed.sum()) if effective.any() else 0,
+            "confidence_unchanged": True,
+            "effective_visibility": "score > 0.5 and inside inclusive native crop before or after repair",
+            "applied": bool(effective.any()),
+            "limitation": "Interpolation is a hypothesis, not observed truth; whole-clip prediction may change.",
+        }
+        if effective.any():
+            import torch
+
+            data = dict(data)
+            data["kp2d"] = torch.as_tensor(candidate, dtype=data["kp2d"].dtype, device=data["kp2d"].device)
+            report["warnings"].append("short_keypoint_repair_applied")
+    return data, report
+
+
+def _finish_observation_stability(portable, report):
+    """Attach advisory evidence only; never edit human geometry or quality grades."""
+    if report is None:
+        return
+    from hmr4d.backends.observation_stability import audit_world_motion
+
+    temporal = audit_world_motion(portable["pred_w_j3d"], float(TARGET_FPS))
+    report["human_temporal_audit"] = temporal
+    report["warnings"] = sorted(set(report["warnings"] + temporal["warnings"]))
+    portable["motiforge_video"]["observation_stability"] = report
+
+
 def _process_item(
     *,
     item: dict[str, Any],
@@ -758,11 +847,18 @@ def _process_item(
     Path(cfg.preprocess_dir).mkdir(parents=True, exist_ok=True)
     _normalize_video(Path(item["source"]), Path(cfg.video_path), options)
 
-    normalized_frames = int(demo.get_video_lwh(cfg.video_path)[0])
+    normalized_frames, width, height = map(int, demo.get_video_lwh(cfg.video_path))
     if normalized_frames < 2:
         raise RuntimeError(f"视频标准化后只有 {normalized_frames} 帧，GVHMR 至少需要 2 帧")
     demo.run_preprocess(cfg)
     data = demo.load_data_dict(cfg)
+    mode = options.get("observation_stability", "audit")
+    boxes = None
+    if mode != "off":
+        import torch
+
+        boxes = _numpy_array(torch.load(cfg.paths.bbx, map_location="cpu", weights_only=True)["bbx_xyxy"])
+    data, stability = _prepare_observation_data(data, mode, image_size=(width, height), boxes=boxes)
     if model is None:
         model = _load_model(cfg)
     pred = model.predict(data, static_cam=cfg.static_cam)
@@ -776,6 +872,9 @@ def _process_item(
         backend_id=backend_id,
         normalized_frames=normalized_frames,
     )
+    _finish_observation_stability(portable, stability)
+    if stability is not None:
+        _atomic_json(output_dir / "observation_stability.json", stability)
 
     prediction = Path(item["prediction"])
     _write_portable_npz(prediction, portable)
@@ -815,6 +914,8 @@ def run_request(request_path: Path, response_path: Path) -> int:
             raise RuntimeError("请求中的 GVHMR backend revision 与当前代码不一致")
         asset_root = Path(request["asset_root"]).expanduser().resolve()
         options = dict(request.get("options", {}))
+        if options.get("observation_stability", "audit") not in OBSERVATION_STABILITY_MODES:
+            raise ValueError("observation_stability must be off, audit or conservative")
         items = list(request.get("items", []))
         if not items:
             raise RuntimeError("GVHMR backend 没有收到视频")
@@ -897,6 +998,15 @@ def _doctor_command(argv: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv == ["capabilities"]:
+        # No checkpoints, Torch imports or CUDA initialization for negotiation.
+        print(json.dumps({
+            "backend": BACKEND_NAME,
+            "protocol": PROTOCOL_VERSION,
+            "backend_revision": backend_revision(),
+            "capabilities": {"observation_stability": list(OBSERVATION_STABILITY_MODES)},
+        }))
+        return 0
     if argv[:1] == ["doctor"]:
         return _doctor_command(argv[1:])
     if argv[:1] == ["export-body-pose"]:
@@ -933,7 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_request(Path(argv[1]), Path(argv[2]))
     print(
         "usage: python -m hmr4d.backends.motiforge "
-        "doctor --asset-root DIR | run REQUEST_JSON RESPONSE_JSON | "
+        "capabilities | doctor --asset-root DIR | run REQUEST_JSON RESPONSE_JSON | "
         "export-foot-surface INPUT --output OUTPUT --asset-root DIR | "
         "export-body-pose INPUT --output OUTPUT --asset-root DIR",
         file=sys.stderr,
