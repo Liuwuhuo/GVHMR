@@ -69,7 +69,8 @@ def backend_revision() -> str:
     # All numerical helpers affect cached predictions/diagnostics.
     digest = hashlib.sha256()
     for path in (Path(__file__).resolve(), Path(__file__).with_name("observation_stability.py"),
-                 Path(__file__).with_name("local_arm_repair.py")):
+                 Path(__file__).with_name("local_arm_repair.py"),
+                 Path(__file__).with_name("arm_gap_repair.py")):
         digest.update(path.name.encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()[:12]
@@ -779,7 +780,7 @@ def _prepare_observation_data(data, mode="audit", *, image_size=None, boxes=None
         "mode": mode,
         "observation_audit": observations,
         "warnings": list(observations["warnings"]),
-        "timeline_policy": "preserve_all_frames; no automatic trimming or gap filling",
+        "timeline_policy": "preserve_all_frames; no trimming or unanchored gap extrapolation",
         "tracking_evidence": "selected smoothed bbox only; raw detector presence and identity unknown",
     }
     if mode == "conservative":
@@ -843,28 +844,15 @@ def _select_observation_candidate(original, candidate, report):
     return candidate if decision["accepted"] else original
 
 
-def _localize_observation_candidate(original, candidate, report, model):
-    """Build a kinematically coherent arm-only hypothesis from the original body.
-
-    Keep original world/camera roots, shape, floor and contact evidence. Both
-    coordinate systems share the same localized SMPL local pose. Native FK is
-    recomputed for the whole body; no independently spliced XYZ tracks.
-    """
+def _arm_pose_prediction(original, pose, model):
+    """Replace shared local pose, keeping roots/shape/evidence; recompute native FK."""
     import copy
 
     import torch
 
-    from hmr4d.backends.local_arm_repair import localize_arm_pose
-
-    for prediction in (original, candidate):
-        if not np.array_equal(_numpy_array(prediction["smpl_params_global"]["body_pose"]),
-                              _numpy_array(prediction["smpl_params_incam"]["body_pose"])):
-            raise ValueError("native global/incam body_pose must share the same local rotations")
-    pose, evidence = localize_arm_pose(
-        _numpy_array(original["smpl_params_global"]["body_pose"]),
-        _numpy_array(candidate["smpl_params_global"]["body_pose"]),
-        report["keypoint_repair"]["effective_runs"], float(TARGET_FPS),
-    )
+    if not np.array_equal(_numpy_array(original["smpl_params_global"]["body_pose"]),
+                          _numpy_array(original["smpl_params_incam"]["body_pose"])):
+        raise ValueError("native global/incam body_pose must share the same local rotations")
     localized = copy.deepcopy(original)
     localized["smpl_params_global"]["body_pose"] = pose
     localized["smpl_params_incam"]["body_pose"] = pose.copy()
@@ -875,16 +863,47 @@ def _localize_observation_candidate(original, candidate, report, model):
               for key, value in localized["smpl_params_global"].items()}
     with torch.inference_mode():
         localized["pred_w_j3d"] = decoder.fk_v2(**params)[0].detach().cpu().numpy()
-    report["local_arm_repair"] = evidence
     return localized
+
+
+def _localize_observation_candidate(original, candidate, report, model):
+    """Build the existing arm-only model-correction hypothesis, not independent XYZ."""
+    from hmr4d.backends.local_arm_repair import localize_arm_pose
+
+    if not np.array_equal(_numpy_array(candidate["smpl_params_global"]["body_pose"]),
+                          _numpy_array(candidate["smpl_params_incam"]["body_pose"])):
+        raise ValueError("native global/incam body_pose must share the same local rotations")
+    pose, evidence = localize_arm_pose(
+        _numpy_array(original["smpl_params_global"]["body_pose"]),
+        _numpy_array(candidate["smpl_params_global"]["body_pose"]),
+        report["keypoint_repair"]["effective_runs"], float(TARGET_FPS),
+    )
+    report["local_arm_repair"] = evidence
+    return _arm_pose_prediction(original, pose, model)
+
+
+def _interpolate_observation_gaps(original, report, data, model, image_size):
+    """Bridge only observed short arm gaps from reliable original-pose neighborhoods."""
+    from hmr4d.backends.arm_gap_repair import interpolate_arm_gaps
+
+    pose, evidence = interpolate_arm_gaps(
+        _numpy_array(original["smpl_params_global"]["body_pose"]),
+        report["keypoint_repair"]["effective_runs"], _numpy_array(data["kp2d"]),
+        _numpy_array(data["bbx_xys"]), float(TARGET_FPS), image_size=image_size,
+    )
+    report["arm_gap_repair"] = evidence
+    if not evidence["changed_pose_frames"]:
+        return None
+    return _arm_pose_prediction(original, pose, model)
 
 
 def _predict_observation_candidate(*, data, mode, image_size, boxes, model, static_cam, make_portable):
     """One native prediction, plus a candidate only for effective repair proposals.
 
     Keep an already acceptable whole-model repair. Otherwise try one localized
-    arm hypothesis, with original root/shape/ground and the same temporal guard.
-    The fifth return value preserves that hypothesis even if it is rejected.
+    arm hypothesis and a short-gap reconstruction, preserving root/shape/ground.
+    A gap must pass the original guard and beat any accepted local correction
+    under that same guard. The last two returns preserve both FK hypotheses.
     Inference failures remain explicit batch failures.
     """
     prepared, report = _prepare_observation_data(data, mode, image_size=image_size, boxes=boxes)
@@ -895,21 +914,45 @@ def _predict_observation_candidate(*, data, mode, image_size, boxes, model, stat
                 "accepted": False, "reasons": ["no_effective_input_change"],
                 "selected": "original", "prediction_passes": 1,
             }
-        return original, report, original, None, None
+        return original, report, original, None, None, None
     candidate = make_portable(model.predict(prepared, static_cam=static_cam))
     selected = _select_observation_candidate(original, candidate, report)
     report["model_candidate_acceptance"] = report["candidate_acceptance"]
-    localized = None
+    localized = gap = None
     if selected is original:
         localized = _localize_observation_candidate(original, candidate, report, model)
         selected = _select_observation_candidate(original, localized, report)
-        if selected is localized:
-            report["keypoint_repair"]["applied_joint_frames"] = report["keypoint_repair"]["candidate_joint_frames"]
+        report["local_candidate_acceptance"] = report["candidate_acceptance"]
+        gap = _interpolate_observation_gaps(original, report, data, model, image_size)
+        if gap is not None:
+            from hmr4d.backends.observation_stability import evaluate_repair_candidate
+
+            repairs = report["keypoint_repair"]["effective_runs"]
+            decision = evaluate_repair_candidate(original["pred_w_j3d"], gap["pred_w_j3d"], float(TARGET_FPS), repairs)
+            report["gap_candidate_acceptance"] = decision
+            accepted = decision["accepted"]
+            if accepted and selected is localized:
+                comparison = evaluate_repair_candidate(
+                    localized["pred_w_j3d"], gap["pred_w_j3d"], float(TARGET_FPS), repairs,
+                )
+                report["gap_vs_local_acceptance"] = comparison
+                accepted = comparison["accepted"]
+            if accepted:
+                selected = gap
+                report["candidate_acceptance"] = decision
+    # Final applied state follows the chosen artifact, not an intermediate vote.
+    repair = report["keypoint_repair"]
+    repair["applied"] = selected is not original
+    repair["applied_joint_frames"] = repair["candidate_joint_frames"] if repair["applied"] else 0
+    report["warnings"] = [code for code in report["warnings"]
+                          if code not in {"short_keypoint_repair_applied", "keypoint_repair_rolled_back"}]
+    report["warnings"].append("short_keypoint_repair_applied" if repair["applied"] else "keypoint_repair_rolled_back")
     report["candidate_acceptance"]["prediction_passes"] = 2
     report["candidate_acceptance"]["selected"] = (
-        "candidate" if selected is candidate else "localized_candidate" if selected is localized else "original"
+        "candidate" if selected is candidate else "gap_candidate" if selected is gap
+        else "localized_candidate" if selected is localized else "original"
     )
-    return selected, report, original, candidate, localized
+    return selected, report, original, candidate, localized, gap
 
 
 def _finish_observation_stability(portable, report):
@@ -961,7 +1004,7 @@ def _process_item(
             normalized_frames=normalized_frames,
         )
 
-    portable, stability, original, candidate, localized = _predict_observation_candidate(
+    portable, stability, original, candidate, localized, gap = _predict_observation_candidate(
         data=data, mode=mode, image_size=(width, height), boxes=boxes,
         model=model, static_cam=cfg.static_cam, make_portable=make_portable,
     )
@@ -976,6 +1019,10 @@ def _process_item(
         _write_portable_npz(output_dir / "observation_local_candidate.npz", localized)
         stability["candidate_evidence"]["localized"] = "observation_local_candidate.npz"
         stability["candidate_evidence"]["localized_scope"] = "arm-local SO3/FK fallback before temporal selection"
+    if gap is not None:
+        _write_portable_npz(output_dir / "observation_gap_candidate.npz", gap)
+        stability["candidate_evidence"]["gap"] = "observation_gap_candidate.npz"
+        stability["candidate_evidence"]["gap_scope"] = "short anchored local-rotation gap/FK before temporal selection"
     _finish_observation_stability(portable, stability)
     if stability is not None:
         _atomic_json(output_dir / "observation_stability.json", stability)

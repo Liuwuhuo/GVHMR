@@ -121,28 +121,30 @@ class StabilityFlowTests(unittest.TestCase):
             self.assertEqual(meta["observation_stability"]["mode"], "conservative")
             self.assertTrue(meta["observation_stability"]["keypoint_repair"]["applied"])
 
-    def run_predictions(self, data, mode):
+    def run_predictions(self, data, mode, gap_factory=None):
         seen = []
         def predict(value, **kwargs):
             seen.append(value)
             return {"pred_w_j3d": np.full((30, 22, 3), len(seen), dtype=float),
                     "motiforge_video": {"fps": 30}, "other_payload": np.array([len(seen)])}
-        result = backend._predict_observation_candidate(
-            data=data, mode=mode, image_size=None, boxes=None,
-            model=SimpleNamespace(predict=predict), static_cam=True, make_portable=lambda pred: pred,
-        )
+        with patch.object(backend, "_interpolate_observation_gaps", side_effect=gap_factory, return_value=None):
+            result = backend._predict_observation_candidate(
+                data=data, mode=mode, image_size=None, boxes=None,
+                model=SimpleNamespace(predict=predict), static_cam=True, make_portable=lambda pred: pred,
+            )
         return result, seen
 
     def test_no_effective_change_and_audit_off_predict_once(self):
         for mode, data in (("off", inputs(True)), ("audit", inputs(True)),
                            ("conservative", inputs()), ("conservative", inputs(True, True))):
             with self.subTest(mode=mode):
-                (selected, report, original, candidate, localized), seen = self.run_predictions(data, mode)
+                (selected, report, original, candidate, localized, gap), seen = self.run_predictions(data, mode)
                 self.assertEqual(len(seen), 1)
                 self.assertIs(seen[0], data)
                 self.assertIs(selected, original)
                 self.assertIsNone(candidate)
                 self.assertIsNone(localized)
+                self.assertIsNone(gap)
                 if mode == "conservative":
                     self.assertEqual(report["candidate_acceptance"]["prediction_passes"], 1)
 
@@ -150,11 +152,12 @@ class StabilityFlowTests(unittest.TestCase):
         with patch("hmr4d.backends.observation_stability.evaluate_repair_candidate",
                    return_value={"accepted": False, "reasons": ["local_regression"]}), \
              patch.object(backend, "_localize_observation_candidate", side_effect=lambda o, c, r, m: copy.deepcopy(c)):
-            (selected, report, original, candidate, localized), seen = self.run_predictions(inputs(True), "conservative")
+            (selected, report, original, candidate, localized, gap), seen = self.run_predictions(inputs(True), "conservative")
         self.assertEqual(len(seen), 2)
         self.assertIs(selected, original)
         self.assertIsNot(selected, candidate)
         self.assertIsNot(selected, localized)
+        self.assertIsNone(gap)
         np.testing.assert_array_equal(selected["other_payload"], [1])
         self.assertFalse(report["keypoint_repair"]["applied"])
         self.assertEqual(report["keypoint_repair"]["applied_joint_frames"], 0)
@@ -166,7 +169,7 @@ class StabilityFlowTests(unittest.TestCase):
         with patch("hmr4d.backends.observation_stability.evaluate_repair_candidate",
                    return_value={"accepted": True, "reasons": []}), \
              patch.object(backend, "_localize_observation_candidate") as localize:
-            (selected, report, original, candidate, localized), seen = self.run_predictions(inputs(True), "conservative")
+            (selected, report, original, candidate, localized, gap), seen = self.run_predictions(inputs(True), "conservative")
         self.assertEqual(len(seen), 2)
         self.assertIs(selected, candidate)
         self.assertIsNot(selected, original)
@@ -175,6 +178,7 @@ class StabilityFlowTests(unittest.TestCase):
         self.assertEqual(report["candidate_acceptance"]["selected"], "candidate")
         np.testing.assert_array_equal(selected["other_payload"], [2])
         self.assertIsNone(localized)
+        self.assertIsNone(gap)
         localize.assert_not_called()
 
     def test_local_fallback_acceptance_updates_applied_and_keeps_both_hypotheses(self):
@@ -186,9 +190,10 @@ class StabilityFlowTests(unittest.TestCase):
             {"accepted": False, "reasons": ["temporal_channel_regression"]},
             {"accepted": True, "reasons": []},
         ]), patch.object(backend, "_localize_observation_candidate", side_effect=localize):
-            (selected, report, original, candidate, localized), seen = self.run_predictions(inputs(True), "conservative")
+            (selected, report, original, candidate, localized, gap), seen = self.run_predictions(inputs(True), "conservative")
         self.assertIs(selected, localized)
         self.assertIsNot(selected, candidate)
+        self.assertIsNone(gap)
         self.assertEqual(len(seen), 2)
         np.testing.assert_array_equal(original["other_payload"], [1])
         np.testing.assert_array_equal(candidate["other_payload"], [2])
@@ -241,22 +246,82 @@ class StabilityFlowTests(unittest.TestCase):
                                    run_preprocess=lambda c: None, load_data_dict=lambda c: data)
             cfg.static_cam = True
             original = {"pred_w_j3d": np.ones((30, 22, 3)), "motiforge_video": {"fps": 30}}
-            candidate, localized = copy.deepcopy(original), copy.deepcopy(original)
+            candidate, localized, gap = (copy.deepcopy(original) for _ in range(3))
             candidate["pred_w_j3d"] *= 2
             localized["pred_w_j3d"] *= 3
-            report = {"warnings": [], "candidate_acceptance": {"selected": "localized_candidate"}}
+            gap["pred_w_j3d"] *= 4
+            report = {"warnings": [], "candidate_acceptance": {"selected": "gap_candidate"}}
             item = {"output_dir": str(root), "source": "source.mp4", "source_sha256": "sha", "cache_key": "key",
                     "prediction": str(root / "result.npz"), "manifest": str(root / "manifest.json")}
             with patch.object(backend, "_compose_config", return_value=cfg), \
                  patch.object(backend, "_normalize_video"), \
                  patch.object(backend, "_predict_observation_candidate",
-                              return_value=(localized, report, original, candidate, localized)):
+                              return_value=(gap, report, original, candidate, localized, gap)):
                 backend._process_item(item=item, options={"observation_stability": "off"}, revision="rev",
                                       backend_id="id", demo=demo, model=object(), detach_to_cpu=lambda x: x)
             for name, expected in (("observation_original", 1), ("observation_candidate", 2),
-                                   ("observation_local_candidate", 3), ("result", 3)):
+                                   ("observation_local_candidate", 3), ("observation_gap_candidate", 4), ("result", 4)):
                 with np.load(root / (name + ".npz"), allow_pickle=False) as value:
                     np.testing.assert_array_equal(value["pred_w_j3d"], expected)
+
+    def test_gap_selection_must_preserve_an_already_accepted_local_repair(self):
+        for local_ok, gap_ok, versus_local_ok, expected in (
+            (True, True, True, "gap_candidate"),
+            (True, True, False, "localized_candidate"),
+            (True, False, None, "localized_candidate"),
+            (False, True, None, "gap_candidate"),
+            (False, False, None, "original"),
+        ):
+            with self.subTest(expected=expected, local_ok=local_ok, gap_ok=gap_ok):
+                decisions = [{"accepted": False, "reasons": ["whole_rejected"]},
+                             {"accepted": local_ok, "reasons": []},
+                             {"accepted": gap_ok, "reasons": []}]
+                if local_ok and gap_ok:
+                    decisions.append({"accepted": versus_local_ok, "reasons": []})
+                def hypothesis(original, *args):
+                    return copy.deepcopy(original)
+                with patch("hmr4d.backends.observation_stability.evaluate_repair_candidate",
+                           side_effect=decisions) as guard, \
+                     patch.object(backend, "_localize_observation_candidate", side_effect=hypothesis):
+                    result, seen = self.run_predictions(inputs(True), "conservative", hypothesis)
+                selected, report, original, candidate, localized, gap = result
+                self.assertIsNot(selected, candidate)
+                self.assertEqual(len(seen), 2)
+                self.assertEqual(guard.call_count, len(decisions))
+                choices = {"original": original, "localized_candidate": localized, "gap_candidate": gap}
+                self.assertIs(selected, choices[expected])
+                self.assertEqual(report["candidate_acceptance"]["selected"], expected)
+                self.assertEqual(report["candidate_acceptance"]["prediction_passes"], 2)
+                applied = expected != "original"
+                self.assertEqual(report["keypoint_repair"]["applied"], applied)
+                self.assertEqual(report["keypoint_repair"]["applied_joint_frames"], 2 if applied else 0)
+                self.assertEqual("keypoint_repair_rolled_back" in report["warnings"], not applied)
+                self.assertEqual("short_keypoint_repair_applied" in report["warnings"], applied)
+                self.assertEqual(report["local_candidate_acceptance"]["accepted"], local_ok)
+                self.assertEqual(report["gap_candidate_acceptance"]["accepted"], gap_ok)
+                if local_ok and gap_ok:
+                    self.assertIs(guard.call_args.args[0], localized["pred_w_j3d"])
+
+    def test_gap_is_not_considered_when_the_whole_model_candidate_passes(self):
+        def unexpected(*args):
+            self.fail("an already accepted model candidate must remain unchanged")
+        with patch("hmr4d.backends.observation_stability.evaluate_repair_candidate",
+                   return_value={"accepted": True, "reasons": []}):
+            result, seen = self.run_predictions(inputs(True), "conservative", unexpected)
+        self.assertIs(result[0], result[3])
+        self.assertEqual(len(seen), 2)
+
+    def test_gap_without_valid_anchors_skips_fk(self):
+        original = {"smpl_params_global": {"body_pose": np.zeros((30, 63), dtype=np.float32)}}
+        _, report = backend._prepare_observation_data(inputs(True), "conservative")
+        # Missing image/crop observations may skip a numerical hypothesis, but
+        # must not fabricate a body model or evaluate FK.
+        with patch("hmr4d.backends.arm_gap_repair.interpolate_arm_gaps",
+                   return_value=(original["smpl_params_global"]["body_pose"], {"changed_pose_frames": 0})), \
+             patch.object(backend, "_arm_pose_prediction") as fk:
+            gap = backend._interpolate_observation_gaps(original, report, inputs(True), object(), None)
+        self.assertIsNone(gap)
+        fk.assert_not_called()
 
     def test_candidate_prediction_exception_is_not_silently_accepted(self):
         from unittest.mock import Mock

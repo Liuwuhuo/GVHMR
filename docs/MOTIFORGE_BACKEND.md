@@ -15,7 +15,7 @@ request/response protocol.
 `python -m hmr4d.backends.motiforge capabilities` provides lightweight protocol,
 mode and implementation identity negotiation without importing Torch or loading
 checkpoints. Default source identity covers the adapter and its observation
-stability helper; a helper change must not reuse an older prediction cache.
+stability, local-arm and short-gap helpers; a helper change must not reuse an older prediction cache.
 
 Prepare the upstream checkpoints described in `docs/INSTALL.md`, then run:
 
@@ -129,9 +129,12 @@ evidence and always predicts the original input. Only an effective conservative
 proposal causes a second prediction using the same model and portable/ground
 path. `_select_observation_candidate` compares both complete human motions using
 `evaluate_repair_candidate`; accepted whole-model repairs remain unchanged.
-For a rejected proposal, `_localize_observation_candidate` tries one arm-local
-SMPL rotation hypothesis and the same guard; only if that also fails is the
-complete original returned. No independent world-joint XYZ tracks are spliced.
+For a rejected proposal, `_localize_observation_candidate` tries an arm-local
+SMPL rotation hypothesis. `_interpolate_observation_gaps` also reconstructs only
+short gaps with reliable adjacent neighborhoods. Both use the same guard; a gap
+must additionally pass against an already accepted local correction to replace
+it. Otherwise the preceding selection is retained. No independent world-joint
+XYZ tracks are spliced.
 `_finish_observation_stability` attaches
 the selected-output audit after this choice. Audit/off/no-hit paths predict once.
 No robot, retarget, contact/height, network-weight or global smoothing change is
@@ -221,8 +224,8 @@ third model prediction, and does not import any robot implementation.
 
 The existing guard thresholds are unchanged. `model_candidate_acceptance` keeps
 the whole-model decision; `local_arm_repair` records the bounded hypothesis;
-the final `candidate_acceptance.selected` is `candidate`, `localized_candidate`
-or `original`. `observation_local_candidate.npz` is saved separately even if
+the final `candidate_acceptance.selected` is `candidate`, `localized_candidate`,
+`gap_candidate` or `original`. `observation_local_candidate.npz` is saved separately even if
 rejected. The final applied flag/count and warning codes reflect the selected
 output, not the initial unsuccessful attempt. Default audit/off and no-hit
 numerics stay unchanged. Backend cache identity includes the new helper.
@@ -233,6 +236,42 @@ whole-model repair, while NJd31/37 still retain their original outputs. This
 does not remove all motion uncertainty or the out-of-frame ankle event at the
 clip tail. Complete35 downstream evidence and current commit identity are
 recorded in sibling MotiForge's regression and implementation documents.
+
+### Short anchored arm gaps
+
+`backends/arm_gap_repair.py::interpolate_arm_gaps` starts from the original local
+SMPL pose, not from the network-correction delta. It merges touching/overlapping
+effective same-side runs and requires the original maximum gap of 1/6 second.
+The three immediately preceding and three immediately following frames must
+have all shoulder/elbow/wrist scores >= 0.7, lie inside the inclusive native
+crop and, when known, the half-open image bounds. Anchors cannot overlap another
+known same-side gap. Insufficient evidence skips the hypothesis; no farther
+anchor search, gap expansion, tail extrapolation or confidence promotion occurs.
+
+A SciPy `RotationSpline` through the six original anchor poses reconstructs only
+the original gap's shoulder/elbow/wrist local rotations. Every other pose sample
+remains exact. The spline's own continuous angular rate/acceleration is not a
+guarantee about finite-difference seams with the retained original trajectory;
+the full original temporal guard remains mandatory. `_arm_pose_prediction`
+shares the preserved-root/shape and full native-FK path with local correction.
+The candidate must pass against the original, and against any accepted localized
+candidate, using unchanged guard thresholds. Accepted whole-model predictions
+are never replaced, and at most two model predictions are made.
+
+`arm_gap_repair` records anchors, skipped reasons and changed frames;
+`local_candidate_acceptance`, `gap_candidate_acceptance` and optional
+`gap_vs_local_acceptance` preserve the selection evidence. The final selected
+artifact alone determines applied flags/warnings. Save
+`observation_gap_candidate.npz` separately even when the guard rejects it.
+Backend identity includes this numerical helper; audit/off remain unchanged.
+
+The two bounded dink08 experiments favored this original-gap-only method.
+Searching for farther high-score blocks made motion smoother but altered visible
+wrist motion and increased its projection error, so that expansion is not
+implemented. The selected candidate further reduces shoulder acceleration over
+the prior local correction, with a small opposite change in one robot-elbow
+acceleration peak. This is not all-channel or ground-truth improvement; paired
+full35 evidence is recorded in MotiForge's regression document.
 
 ## Optional foot-surface evidence from an existing prediction
 
