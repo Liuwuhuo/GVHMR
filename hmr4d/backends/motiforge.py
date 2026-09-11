@@ -66,9 +66,10 @@ def _sha256(path: Path) -> str:
 def backend_revision() -> str:
     """Return an identity for the protocol implementation itself."""
 
-    # Both files affect cached predictions/diagnostics. Do not key only this adapter.
+    # All numerical helpers affect cached predictions/diagnostics.
     digest = hashlib.sha256()
-    for path in (Path(__file__).resolve(), Path(__file__).with_name("observation_stability.py")):
+    for path in (Path(__file__).resolve(), Path(__file__).with_name("observation_stability.py"),
+                 Path(__file__).with_name("local_arm_repair.py")):
         digest.update(path.name.encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()[:12]
@@ -832,19 +833,59 @@ def _select_observation_candidate(original, candidate, report):
     )
     report["candidate_acceptance"] = decision
     repair["applied"] = bool(decision["accepted"])
+    report["warnings"] = [code for code in report["warnings"]
+                          if code not in {"short_keypoint_repair_applied", "keypoint_repair_rolled_back"}]
+    if decision["accepted"]:
+        report["warnings"].append("short_keypoint_repair_applied")
     if not decision["accepted"]:
         repair["applied_joint_frames"] = 0
-        report["warnings"] = [code for code in report["warnings"] if code != "short_keypoint_repair_applied"]
         report["warnings"].append("keypoint_repair_rolled_back")
     return candidate if decision["accepted"] else original
+
+
+def _localize_observation_candidate(original, candidate, report, model):
+    """Build a kinematically coherent arm-only hypothesis from the original body.
+
+    Keep original world/camera roots, shape, floor and contact evidence. Both
+    coordinate systems share the same localized SMPL local pose. Native FK is
+    recomputed for the whole body; no independently spliced XYZ tracks.
+    """
+    import copy
+
+    import torch
+
+    from hmr4d.backends.local_arm_repair import localize_arm_pose
+
+    for prediction in (original, candidate):
+        if not np.array_equal(_numpy_array(prediction["smpl_params_global"]["body_pose"]),
+                              _numpy_array(prediction["smpl_params_incam"]["body_pose"])):
+            raise ValueError("native global/incam body_pose must share the same local rotations")
+    pose, evidence = localize_arm_pose(
+        _numpy_array(original["smpl_params_global"]["body_pose"]),
+        _numpy_array(candidate["smpl_params_global"]["body_pose"]),
+        report["keypoint_repair"]["effective_runs"], float(TARGET_FPS),
+    )
+    localized = copy.deepcopy(original)
+    localized["smpl_params_global"]["body_pose"] = pose
+    localized["smpl_params_incam"]["body_pose"] = pose.copy()
+    decoder = model.pipeline.endecoder
+    # Use the already-loaded native FK, not a second body-model installation.
+    device = decoder.parents_tensor.device
+    params = {key: torch.as_tensor(_numpy_array(value), device=device)[None]
+              for key, value in localized["smpl_params_global"].items()}
+    with torch.inference_mode():
+        localized["pred_w_j3d"] = decoder.fk_v2(**params)[0].detach().cpu().numpy()
+    report["local_arm_repair"] = evidence
+    return localized
 
 
 def _predict_observation_candidate(*, data, mode, image_size, boxes, model, static_cam, make_portable):
     """One native prediction, plus a candidate only for effective repair proposals.
 
-    Both predictions use the same temporal model and existing portable/ground
-    path. The caller persists the two complete pieces of evidence before adding
-    the selected-output audit. Inference failures remain explicit batch failures.
+    Keep an already acceptable whole-model repair. Otherwise try one localized
+    arm hypothesis, with original root/shape/ground and the same temporal guard.
+    The fifth return value preserves that hypothesis even if it is rejected.
+    Inference failures remain explicit batch failures.
     """
     prepared, report = _prepare_observation_data(data, mode, image_size=image_size, boxes=boxes)
     original = make_portable(model.predict(data, static_cam=static_cam))
@@ -854,12 +895,21 @@ def _predict_observation_candidate(*, data, mode, image_size, boxes, model, stat
                 "accepted": False, "reasons": ["no_effective_input_change"],
                 "selected": "original", "prediction_passes": 1,
             }
-        return original, report, original, None
+        return original, report, original, None, None
     candidate = make_portable(model.predict(prepared, static_cam=static_cam))
     selected = _select_observation_candidate(original, candidate, report)
+    report["model_candidate_acceptance"] = report["candidate_acceptance"]
+    localized = None
+    if selected is original:
+        localized = _localize_observation_candidate(original, candidate, report, model)
+        selected = _select_observation_candidate(original, localized, report)
+        if selected is localized:
+            report["keypoint_repair"]["applied_joint_frames"] = report["keypoint_repair"]["candidate_joint_frames"]
     report["candidate_acceptance"]["prediction_passes"] = 2
-    report["candidate_acceptance"]["selected"] = "candidate" if selected is candidate else "original"
-    return selected, report, original, candidate
+    report["candidate_acceptance"]["selected"] = (
+        "candidate" if selected is candidate else "localized_candidate" if selected is localized else "original"
+    )
+    return selected, report, original, candidate, localized
 
 
 def _finish_observation_stability(portable, report):
@@ -911,7 +961,7 @@ def _process_item(
             normalized_frames=normalized_frames,
         )
 
-    portable, stability, original, candidate = _predict_observation_candidate(
+    portable, stability, original, candidate, localized = _predict_observation_candidate(
         data=data, mode=mode, image_size=(width, height), boxes=boxes,
         model=model, static_cam=cfg.static_cam, make_portable=make_portable,
     )
@@ -920,8 +970,12 @@ def _process_item(
         _write_portable_npz(output_dir / "observation_candidate.npz", candidate)
         stability["candidate_evidence"] = {
             "original": "observation_original.npz", "candidate": "observation_candidate.npz",
-            "scope": "complete pre-selection portable predictions; same model and ground settings",
+            "scope": "complete original and whole-model candidate before temporal selection",
         }
+    if localized is not None:
+        _write_portable_npz(output_dir / "observation_local_candidate.npz", localized)
+        stability["candidate_evidence"]["localized"] = "observation_local_candidate.npz"
+        stability["candidate_evidence"]["localized_scope"] = "arm-local SO3/FK fallback before temporal selection"
     _finish_observation_stability(portable, stability)
     if stability is not None:
         _atomic_json(output_dir / "observation_stability.json", stability)

@@ -137,21 +137,24 @@ class StabilityFlowTests(unittest.TestCase):
         for mode, data in (("off", inputs(True)), ("audit", inputs(True)),
                            ("conservative", inputs()), ("conservative", inputs(True, True))):
             with self.subTest(mode=mode):
-                (selected, report, original, candidate), seen = self.run_predictions(data, mode)
+                (selected, report, original, candidate, localized), seen = self.run_predictions(data, mode)
                 self.assertEqual(len(seen), 1)
                 self.assertIs(seen[0], data)
                 self.assertIs(selected, original)
                 self.assertIsNone(candidate)
+                self.assertIsNone(localized)
                 if mode == "conservative":
                     self.assertEqual(report["candidate_acceptance"]["prediction_passes"], 1)
 
     def test_guard_rejection_returns_whole_original_and_corrects_provenance(self):
         with patch("hmr4d.backends.observation_stability.evaluate_repair_candidate",
-                   return_value={"accepted": False, "reasons": ["local_regression"]}):
-            (selected, report, original, candidate), seen = self.run_predictions(inputs(True), "conservative")
+                   return_value={"accepted": False, "reasons": ["local_regression"]}), \
+             patch.object(backend, "_localize_observation_candidate", side_effect=lambda o, c, r, m: copy.deepcopy(c)):
+            (selected, report, original, candidate, localized), seen = self.run_predictions(inputs(True), "conservative")
         self.assertEqual(len(seen), 2)
         self.assertIs(selected, original)
         self.assertIsNot(selected, candidate)
+        self.assertIsNot(selected, localized)
         np.testing.assert_array_equal(selected["other_payload"], [1])
         self.assertFalse(report["keypoint_repair"]["applied"])
         self.assertEqual(report["keypoint_repair"]["applied_joint_frames"], 0)
@@ -161,8 +164,9 @@ class StabilityFlowTests(unittest.TestCase):
 
     def test_guard_acceptance_returns_whole_candidate(self):
         with patch("hmr4d.backends.observation_stability.evaluate_repair_candidate",
-                   return_value={"accepted": True, "reasons": []}):
-            (selected, report, original, candidate), seen = self.run_predictions(inputs(True), "conservative")
+                   return_value={"accepted": True, "reasons": []}), \
+             patch.object(backend, "_localize_observation_candidate") as localize:
+            (selected, report, original, candidate, localized), seen = self.run_predictions(inputs(True), "conservative")
         self.assertEqual(len(seen), 2)
         self.assertIs(selected, candidate)
         self.assertIsNot(selected, original)
@@ -170,6 +174,89 @@ class StabilityFlowTests(unittest.TestCase):
         self.assertTrue(report["keypoint_repair"]["applied"])
         self.assertEqual(report["candidate_acceptance"]["selected"], "candidate")
         np.testing.assert_array_equal(selected["other_payload"], [2])
+        self.assertIsNone(localized)
+        localize.assert_not_called()
+
+    def test_local_fallback_acceptance_updates_applied_and_keeps_both_hypotheses(self):
+        def localize(original, candidate, report, model):
+            output = copy.deepcopy(original)
+            output["other_payload"] = np.array([3])
+            return output
+        with patch("hmr4d.backends.observation_stability.evaluate_repair_candidate", side_effect=[
+            {"accepted": False, "reasons": ["temporal_channel_regression"]},
+            {"accepted": True, "reasons": []},
+        ]), patch.object(backend, "_localize_observation_candidate", side_effect=localize):
+            (selected, report, original, candidate, localized), seen = self.run_predictions(inputs(True), "conservative")
+        self.assertIs(selected, localized)
+        self.assertIsNot(selected, candidate)
+        self.assertEqual(len(seen), 2)
+        np.testing.assert_array_equal(original["other_payload"], [1])
+        np.testing.assert_array_equal(candidate["other_payload"], [2])
+        np.testing.assert_array_equal(selected["other_payload"], [3])
+        self.assertFalse(report["model_candidate_acceptance"]["accepted"])
+        self.assertTrue(report["candidate_acceptance"]["accepted"])
+        self.assertEqual(report["candidate_acceptance"]["selected"], "localized_candidate")
+        self.assertTrue(report["keypoint_repair"]["applied"])
+        self.assertEqual(report["keypoint_repair"]["applied_joint_frames"], 2)
+        self.assertIn("short_keypoint_repair_applied", report["warnings"])
+        self.assertNotIn("keypoint_repair_rolled_back", report["warnings"])
+
+    def test_localization_uses_native_fk_and_preserves_all_nonpose_evidence(self):
+        params = {"body_pose": np.zeros((30, 63), dtype=np.float32),
+                  "betas": np.ones((30, 10), dtype=np.float32),
+                  "transl": np.ones((30, 3), dtype=np.float32),
+                  "global_orient": np.zeros((30, 3), dtype=np.float32)}
+        original = {"smpl_params_global": copy.deepcopy(params), "smpl_params_incam": copy.deepcopy(params),
+                    "pred_w_j3d": np.zeros((30, 22, 3)), "floor_correction_y": np.arange(30.),
+                    "left_contact_confidence": np.linspace(0, 1, 30), "motiforge_video": {"fps": 30}}
+        candidate = copy.deepcopy(original)
+        for key in ("smpl_params_global", "smpl_params_incam"):
+            candidate[key]["body_pose"][:] = 0.2
+            candidate[key]["transl"][:] = 100  # Must not enter the localized hypothesis.
+            candidate[key]["betas"][:] = 2
+        _, report = backend._prepare_observation_data(inputs(True), "conservative")
+        from unittest.mock import Mock
+        fk = Mock(return_value=torch.ones((1, 30, 22, 3)))
+        model = SimpleNamespace(pipeline=SimpleNamespace(endecoder=SimpleNamespace(
+            parents_tensor=torch.zeros(22, dtype=torch.long), fk_v2=fk)))
+        localized = backend._localize_observation_candidate(original, candidate, report, model)
+        np.testing.assert_array_equal(localized["pred_w_j3d"], 1)
+        fk.assert_called_once()
+        for key in ("smpl_params_global", "smpl_params_incam"):
+            for field in ("transl", "betas", "global_orient"):
+                np.testing.assert_array_equal(localized[key][field], original[key][field])
+            np.testing.assert_array_equal(original[key]["body_pose"], 0)
+        np.testing.assert_array_equal(localized["smpl_params_global"]["body_pose"],
+                                      localized["smpl_params_incam"]["body_pose"])
+        for key in ("floor_correction_y", "left_contact_confidence"):
+            np.testing.assert_array_equal(localized[key], original[key])
+        np.testing.assert_array_equal(fk.call_args.kwargs["transl"].numpy()[0], params["transl"])
+
+    def test_local_candidate_evidence_is_persisted_separately(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg = SimpleNamespace(output_dir=root, preprocess_dir=root, video_path=root / "input.mp4")
+            data = inputs()
+            demo = SimpleNamespace(get_video_lwh=lambda p: (30, 200, 200),
+                                   run_preprocess=lambda c: None, load_data_dict=lambda c: data)
+            cfg.static_cam = True
+            original = {"pred_w_j3d": np.ones((30, 22, 3)), "motiforge_video": {"fps": 30}}
+            candidate, localized = copy.deepcopy(original), copy.deepcopy(original)
+            candidate["pred_w_j3d"] *= 2
+            localized["pred_w_j3d"] *= 3
+            report = {"warnings": [], "candidate_acceptance": {"selected": "localized_candidate"}}
+            item = {"output_dir": str(root), "source": "source.mp4", "source_sha256": "sha", "cache_key": "key",
+                    "prediction": str(root / "result.npz"), "manifest": str(root / "manifest.json")}
+            with patch.object(backend, "_compose_config", return_value=cfg), \
+                 patch.object(backend, "_normalize_video"), \
+                 patch.object(backend, "_predict_observation_candidate",
+                              return_value=(localized, report, original, candidate, localized)):
+                backend._process_item(item=item, options={"observation_stability": "off"}, revision="rev",
+                                      backend_id="id", demo=demo, model=object(), detach_to_cpu=lambda x: x)
+            for name, expected in (("observation_original", 1), ("observation_candidate", 2),
+                                   ("observation_local_candidate", 3), ("result", 3)):
+                with np.load(root / (name + ".npz"), allow_pickle=False) as value:
+                    np.testing.assert_array_equal(value["pred_w_j3d"], expected)
 
     def test_candidate_prediction_exception_is_not_silently_accepted(self):
         from unittest.mock import Mock

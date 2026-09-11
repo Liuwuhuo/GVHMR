@@ -128,8 +128,11 @@ The adapter calls `_predict_observation_candidate`: it prepares observation
 evidence and always predicts the original input. Only an effective conservative
 proposal causes a second prediction using the same model and portable/ground
 path. `_select_observation_candidate` compares both complete human motions using
-`evaluate_repair_candidate`; failed or unhelpful candidates roll back as a whole,
-without splicing, freezing or smoothing. `_finish_observation_stability` attaches
+`evaluate_repair_candidate`; accepted whole-model repairs remain unchanged.
+For a rejected proposal, `_localize_observation_candidate` tries one arm-local
+SMPL rotation hypothesis and the same guard; only if that also fails is the
+complete original returned. No independent world-joint XYZ tracks are spliced.
+`_finish_observation_stability` attaches
 the selected-output audit after this choice. Audit/off/no-hit paths predict once.
 No robot, retarget, contact/height, network-weight or global smoothing change is
 part of this stage. `audit` is not a physical quality gate. A large velocity alone
@@ -197,6 +200,39 @@ The other31 preserve cached source numerics with explicit reuse provenance.
 Full downstream results are recorded under sibling MotiForge's ignored
 `out/gvhmr-stability-guarded-20260911/` and `docs/regression_baseline.md`.
 Default audit is unchanged; rejecting a repair does not remove original spikes.
+
+### Local arm fallback
+
+`backends/local_arm_repair.py::localize_arm_pose` addresses whole-body side effects
+from a short 2D arm edit. Only the affected side's SMPL22 shoulder/elbow/wrist
+(left 16/18/20, right 17/19/21; body-pose indices minus one) can change, using
+`R_raw Exp(g*w*Log(R_raw^-1 R_candidate))`. Gains are fixed at shoulder 1 and
+elbow/wrist 0.5. The error interval has unit window weight; a 0.25-second quintic
+C2 taper returns it to zero on both sides. Touching/overlapping hit intervals
+are merged and other tapers use a smooth union, avoiding max-weight cusps.
+
+The original shape, global/camera roots/translations, all other local poses,
+contacts and floor correction remain unchanged. Both coordinate systems share
+the same localized body pose and the already-loaded native `fk_v2` recomputes
+the complete world skeleton. Position differences outside the arm may include
+float32 roundoff from recomputing an already ground-adjusted translation; local
+pose/parameter invariants are exact. This is not arbitrary XYZ stitching or a
+third model prediction, and does not import any robot implementation.
+
+The existing guard thresholds are unchanged. `model_candidate_acceptance` keeps
+the whole-model decision; `local_arm_repair` records the bounded hypothesis;
+the final `candidate_acceptance.selected` is `candidate`, `localized_candidate`
+or `original`. `observation_local_candidate.npz` is saved separately even if
+rejected. The final applied flag/count and warning codes reflect the selected
+output, not the initial unsuccessful attempt. Default audit/off and no-hit
+numerics stay unchanged. Backend cache identity includes the new helper.
+
+The frozen dink08 test reduces two shoulder acceleration peaks by about 43%
+and 52% without reducing Mink's speed limit; NJd07 keeps its previously accepted
+whole-model repair, while NJd31/37 still retain their original outputs. This
+does not remove all motion uncertainty or the out-of-frame ankle event at the
+clip tail. Complete35 downstream evidence and current commit identity are
+recorded in sibling MotiForge's regression and implementation documents.
 
 ## Optional foot-surface evidence from an existing prediction
 
