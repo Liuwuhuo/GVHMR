@@ -799,6 +799,10 @@ def _prepare_observation_data(data, mode="audit", *, image_size=None, boxes=None
         report["keypoint_repair"] = {
             "policy": POLICY,
             "accepted": accepted,
+            "effective_runs": [
+                entry for entry in accepted
+                if effective[entry["start_frame"]:entry["stop_frame_exclusive"], entry["joint_index"]].any()
+            ],
             "rejected_run_count": len(rejected),
             "rejection_reason_counts": rejection_counts,
             "candidate_joint_frames": int(changed.sum()),
@@ -816,6 +820,46 @@ def _prepare_observation_data(data, mode="audit", *, image_size=None, boxes=None
             data["kp2d"] = torch.as_tensor(candidate, dtype=data["kp2d"].dtype, device=data["kp2d"].device)
             report["warnings"].append("short_keypoint_repair_applied")
     return data, report
+
+
+def _select_observation_candidate(original, candidate, report):
+    """Choose one complete human prediction; never splice poses or use a robot."""
+    from hmr4d.backends.observation_stability import evaluate_repair_candidate
+
+    repair = report["keypoint_repair"]
+    decision = evaluate_repair_candidate(
+        original["pred_w_j3d"], candidate["pred_w_j3d"], float(TARGET_FPS), repair["effective_runs"],
+    )
+    report["candidate_acceptance"] = decision
+    repair["applied"] = bool(decision["accepted"])
+    if not decision["accepted"]:
+        repair["applied_joint_frames"] = 0
+        report["warnings"] = [code for code in report["warnings"] if code != "short_keypoint_repair_applied"]
+        report["warnings"].append("keypoint_repair_rolled_back")
+    return candidate if decision["accepted"] else original
+
+
+def _predict_observation_candidate(*, data, mode, image_size, boxes, model, static_cam, make_portable):
+    """One native prediction, plus a candidate only for effective repair proposals.
+
+    Both predictions use the same temporal model and existing portable/ground
+    path. The caller persists the two complete pieces of evidence before adding
+    the selected-output audit. Inference failures remain explicit batch failures.
+    """
+    prepared, report = _prepare_observation_data(data, mode, image_size=image_size, boxes=boxes)
+    original = make_portable(model.predict(data, static_cam=static_cam))
+    if prepared is data:
+        if mode == "conservative":
+            report["candidate_acceptance"] = {
+                "accepted": False, "reasons": ["no_effective_input_change"],
+                "selected": "original", "prediction_passes": 1,
+            }
+        return original, report, original, None
+    candidate = make_portable(model.predict(prepared, static_cam=static_cam))
+    selected = _select_observation_candidate(original, candidate, report)
+    report["candidate_acceptance"]["prediction_passes"] = 2
+    report["candidate_acceptance"]["selected"] = "candidate" if selected is candidate else "original"
+    return selected, report, original, candidate
 
 
 def _finish_observation_stability(portable, report):
@@ -858,20 +902,26 @@ def _process_item(
         import torch
 
         boxes = _numpy_array(torch.load(cfg.paths.bbx, map_location="cpu", weights_only=True)["bbx_xyxy"])
-    data, stability = _prepare_observation_data(data, mode, image_size=(width, height), boxes=boxes)
     if model is None:
         model = _load_model(cfg)
-    pred = model.predict(data, static_cam=cfg.static_cam)
-    portable = _portable_prediction(
-        pred=pred,
-        model=model,
-        detach_to_cpu=detach_to_cpu,
-        item=item,
-        options=options,
-        revision=revision,
-        backend_id=backend_id,
-        normalized_frames=normalized_frames,
+    def make_portable(pred):
+        return _portable_prediction(
+            pred=pred, model=model, detach_to_cpu=detach_to_cpu, item=item,
+            options=options, revision=revision, backend_id=backend_id,
+            normalized_frames=normalized_frames,
+        )
+
+    portable, stability, original, candidate = _predict_observation_candidate(
+        data=data, mode=mode, image_size=(width, height), boxes=boxes,
+        model=model, static_cam=cfg.static_cam, make_portable=make_portable,
     )
+    if candidate is not None:
+        _write_portable_npz(output_dir / "observation_original.npz", original)
+        _write_portable_npz(output_dir / "observation_candidate.npz", candidate)
+        stability["candidate_evidence"] = {
+            "original": "observation_original.npz", "candidate": "observation_candidate.npz",
+            "scope": "complete pre-selection portable predictions; same model and ground settings",
+        }
     _finish_observation_stability(portable, stability)
     if stability is not None:
         _atomic_json(output_dir / "observation_stability.json", stability)

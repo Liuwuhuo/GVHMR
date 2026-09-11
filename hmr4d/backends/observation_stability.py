@@ -295,3 +295,146 @@ def audit_world_motion(joints, fps):
     }
     report["events"].sort(key=lambda event: (event["start_frame"], event["end_frame"], event["joint_index"]))
     return report
+
+
+CANDIDATE_GUARD_POLICY = {
+    "schema": "source-local-temporal-candidate-guard-v1",
+    "window_padding_seconds": 0.25,
+    "maximum_relative_increase": 0.10,
+    "minimum_relative_acceleration_improvement": 0.10,
+    "absolute_increase_floors": {
+        "position": [0.03, 1.0, 30.0],
+        "direction": [0.10, 3.0, 90.0],
+        "angle": [0.10, 3.0, 90.0],
+    },
+    "metric_order": ["speed", "acceleration", "jerk"],
+    "units": "position: m/s^n; bone unit direction: 1/s^n; elbow angle: rad/s^n",
+    "comparison": "Per-channel peak in each padded repair window, whole clip and outside all windows.",
+    "acceptance": "Every repaired limb/window needs acceleration reduction >= max(10%, absolute floor); "
+                  "no channel peak may increase by more than 10% plus its absolute floor.",
+    "selection": "whole original or whole candidate; no stitching, smoothing or timeline changes",
+    "limitation": "A temporal guard, not pose ground truth or a guarantee about downstream robot motion.",
+}
+_SMPL22_PARENTS = np.array([0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19])
+
+
+def _guard_channels(joints):
+    positions = joints.astype(np.float64, copy=False)
+    channels = {"root_world": (positions[:, 0], "position")}
+    for joint in range(1, 22):
+        channels[f"root_relative_{joint}"] = (positions[:, joint] - positions[:, 0], "position")
+    bones = positions[:, 1:] - positions[:, _SMPL22_PARENTS[1:]]
+    lengths = np.linalg.norm(bones, axis=-1, keepdims=True)
+    if not np.isfinite(lengths).all() or np.any(lengths <= 1e-8):
+        raise ValueError("guard requires non-degenerate finite SMPL22 bones")
+    for joint in range(1, 22):
+        channels[f"bone_direction_{joint}"] = (bones[:, joint - 1] / lengths[:, joint - 1], "direction")
+    for shoulder, elbow, wrist in ((16, 18, 20), (17, 19, 21)):
+        for joint in (elbow, wrist):
+            channels[f"shoulder_relative_{joint}"] = (positions[:, joint] - positions[:, shoulder], "position")
+        upper, lower = positions[:, elbow] - positions[:, shoulder], positions[:, wrist] - positions[:, elbow]
+        bend = np.arctan2(np.linalg.norm(np.cross(upper, lower), axis=-1), np.sum(upper * lower, axis=-1))
+        channels[f"elbow_angle_{elbow}"] = (bend[:, None], "angle")
+    return channels
+
+
+def _guard_motion(joints):
+    positions = np.asarray(joints)
+    if (
+        positions.ndim != 3 or positions.shape[1:] != (22, 3) or not len(positions)
+        or positions.dtype.kind not in "fiu" or not np.isfinite(positions).all()
+    ):
+        raise ValueError("guard requires nonempty finite shape (T, 22, 3)")
+    return positions
+
+
+def evaluate_repair_candidate(original_joints, candidate_joints, fps, repairs):
+    """Compare SMPL22 metre/Y-up candidates, leaving both complete motions intact.
+
+    ``repairs`` contains effective COCO elbow/wrist runs with ``joint``,
+    ``start_frame`` and ``stop_frame_exclusive`` on the common timeline. The
+    caller must exclude changes masked out of the native model input. An invalid
+    reference/repair contract raises; an invalid candidate fails closed. A
+    rejected result means use the COMPLETE original model output, not slices.
+    """
+    original, fps = _guard_motion(original_joints), _validated_fps(fps)
+    frames = len(original)
+    try:
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            before = _guard_channels(original)
+    except FloatingPointError as error:
+        raise ValueError("reference geometry exceeds finite arithmetic") from error
+    if not isinstance(repairs, (list, tuple)):
+        raise ValueError("repairs must be a list of effective keypoint run dictionaries")  # noqa: TRY004
+    windows = []
+    padding = max(1, round(fps * CANDIDATE_GUARD_POLICY["window_padding_seconds"]))
+    for repair in repairs:
+        if not isinstance(repair, dict) or repair.get("joint") not in {item[1] for item in JOINTS.values()}:
+            raise ValueError("repair must identify a COCO elbow or wrist")
+        start, stop = repair.get("start_frame"), repair.get("stop_frame_exclusive")
+        if (
+            not all(isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
+                    for value in (start, stop)) or not 0 <= start < stop <= frames
+        ):
+            raise ValueError("repair interval must be integer [start, stop) on the original timeline")
+        windows.append({"joint": repair["joint"], "start_frame": int(max(0, start - padding)),
+                        "stop_frame_exclusive": int(min(frames, stop + padding)), "improved_channels": []})
+    report = {"accepted": False, "reasons": [], "policy": CANDIDATE_GUARD_POLICY.copy(),
+              "frame_count": frames, "fps": fps, "windows": windows, "violations": [], "comparisons": []}
+    try:
+        candidate = _guard_motion(candidate_joints)
+        if candidate.shape != original.shape:
+            raise ValueError("candidate timeline differs from reference")
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            after = _guard_channels(candidate)
+    except (TypeError, ValueError, FloatingPointError) as error:
+        report.update(reasons=["invalid_candidate"], candidate_error=str(error))
+        return report
+    if frames < 4 or not windows:
+        report["reasons"].append("insufficient_temporal_evidence" if frames < 4 else "no_effective_repairs")
+        return report
+    for channel, (values, kind) in before.items():
+        for order, metric in enumerate(CANDIDATE_GUARD_POLICY["metric_order"], 1):
+            with np.errstate(over="raise", invalid="raise"):
+                try:
+                    baseline = np.linalg.norm(np.diff(values, n=order, axis=0), axis=-1) * fps ** order
+                except (FloatingPointError, OverflowError) as error:
+                    raise ValueError("reference temporal metrics exceed finite arithmetic") from error
+                try:
+                    proposed = np.linalg.norm(np.diff(after[channel][0], n=order, axis=0), axis=-1) * fps ** order
+                except FloatingPointError:
+                    report.update(reasons=["invalid_candidate"], candidate_error="non-finite temporal metric")
+                    return report
+            centers = np.arange(len(baseline)) + order / 2
+            masks = [(centers >= window["start_frame"]) & (centers < window["stop_frame_exclusive"])
+                     for window in windows]
+            regions = [("full_clip", np.ones(len(baseline), dtype=bool)),
+                       ("outside_windows", ~np.logical_or.reduce(masks))]
+            regions.extend((f"window_{index}", mask) for index, mask in enumerate(masks))
+            floor = CANDIDATE_GUARD_POLICY["absolute_increase_floors"][kind][order - 1]
+            for region, mask in regions:
+                if not np.any(mask):
+                    continue
+                old, new = float(baseline[mask].max()), float(proposed[mask].max())
+                limit = old * (1 + CANDIDATE_GUARD_POLICY["maximum_relative_increase"]) + floor
+                item = {"region": region, "channel": channel, "metric": metric,
+                        "before": old, "candidate": new, "maximum_allowed": limit}
+                report["comparisons"].append(item)
+                if new > limit:
+                    report["violations"].append(item)
+                if region.startswith("window_") and order == 2:
+                    window = windows[int(region.removeprefix("window_"))]
+                    elbow, wrist = (18, 20) if window["joint"].startswith("left_") else (19, 21)
+                    limb_channels = {f"{prefix}_{joint}" for joint in (elbow, wrist)
+                                     for prefix in ("root_relative", "shoulder_relative", "bone_direction")}
+                    limb_channels.add(f"elbow_angle_{elbow}")
+                    if channel in limb_channels and old - new >= max(
+                        floor, old * CANDIDATE_GUARD_POLICY["minimum_relative_acceleration_improvement"],
+                    ):
+                        window["improved_channels"].append(channel)
+    if report["violations"]:
+        report["reasons"].append("temporal_channel_regression")
+    if any(not window["improved_channels"] for window in windows):
+        report["reasons"].append("no_local_acceleration_improvement")
+    report["accepted"] = not report["reasons"]
+    return report

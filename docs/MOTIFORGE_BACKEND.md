@@ -124,8 +124,13 @@ The optional request field `options.observation_stability` defaults to `audit`:
   model input. The original native bbox/ViT cache is retained unchanged.
 
 The NumPy-only `backends/observation_stability.py` owns the numerical policy.
-The adapter calls `_prepare_observation_data` before the single normal model
-prediction and `_finish_observation_stability` after portable geometry export.
+The adapter calls `_predict_observation_candidate`: it prepares observation
+evidence and always predicts the original input. Only an effective conservative
+proposal causes a second prediction using the same model and portable/ground
+path. `_select_observation_candidate` compares both complete human motions using
+`evaluate_repair_candidate`; failed or unhelpful candidates roll back as a whole,
+without splicing, freezing or smoothing. `_finish_observation_stability` attaches
+the selected-output audit after this choice. Audit/off/no-hit paths predict once.
 No robot, retarget, contact/height, network-weight or global smoothing change is
 part of this stage. `audit` is not a physical quality gate. A large velocity alone
 does not establish an invalid action, and an interpolated coordinate is a
@@ -158,7 +163,40 @@ wrist, robot elbow peak acceleration in 13.82–14.26 s rises from 98.75 to
 136.41 rad/s² despite a slightly lower whole-clip jerk p95. This is not unrelated
 tail noise. Consequently only audit is accepted as the default; conservative
 remains experimental opt-in, not a generally regression-free correction.
-All 67 backend unit tests pass. No threshold was tuned to exclude this one clip.
+These figures describe the first unguarded implementation, before the following
+acceptance guard; no threshold was tuned to exclude a video by identity.
+
+### Candidate temporal guard v1
+
+The source-only guard compares 49 channels separately: world root, 21 root-relative
+joints, 21 unit bone directions, four shoulder-relative elbow/wrist trajectories
+and two elbow angles. It measures finite-difference speed/acceleration/jerk peaks
+in every effective repair interval padded by 0.25 seconds, the full clip and the
+outside-window region. Derivative samples belong to a region by their stencil
+midpoint on the original timeline. No channel peak may exceed its reference by
+more than 10% plus an absolute floor: position [0.03, 1, 30] in m/s^n; unit bone
+direction [0.1, 3, 90] in 1/s^n; elbow angle [0.1, 3, 90] in rad/s^n.
+Each repaired limb/window also needs an acceleration decrease of at least the
+larger of 10% and the corresponding floor in one of its channels. Invalid or
+degenerate candidate geometry is rejected; invalid reference/contracts fail
+explicitly. This checks changes in temporal peaks, not pose accuracy, all local
+oscillations, amplitude preservation or downstream robot feasibility.
+
+The report records `candidate_acceptance`, per-channel measurements and reasons.
+Rejected candidates have `keypoint_repair.applied=false`, zero applied frames and
+`keypoint_repair_rolled_back`; attempted coordinates remain available as evidence.
+Both complete pre-selection portable outputs are saved as
+`observation_original.npz` and `observation_candidate.npz` when dual inference ran.
+Prediction failures remain explicit per-video failures, not silent acceptance.
+No new passes are added to detector/ViTPose/features, and the model stays loaded.
+
+Four paired fresh inferences on the same35 cached videos reproduced the original
+numerics exactly. The fixed guard accepts NJd07 and rolls back NJd31, NJd37 and
+dink08 (including smaller other-limb regressions despite its shoulder improvement).
+The other31 preserve cached source numerics with explicit reuse provenance.
+Full downstream results are recorded under sibling MotiForge's ignored
+`out/gvhmr-stability-guarded-20260911/` and `docs/regression_baseline.md`.
+Default audit is unchanged; rejecting a repair does not remove original spikes.
 
 ## Optional foot-surface evidence from an existing prediction
 
