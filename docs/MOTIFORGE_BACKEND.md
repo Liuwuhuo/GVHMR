@@ -150,6 +150,16 @@ Regression evidence is maintained in sibling MotiForge's
 `docs/regression_baseline.md`, with full35 cached-video and fixed Mink comparisons
 under its ignored `out/gvhmr-stability-20260911/` directory.
 
+The 2026-09-11 full35 test preserves audit numerics and confirms 4 clips / 10
+effective visible keypoint-frame edits. The paired full-sequence fresh off/audit
+control is exactly equal. Conservative repair reduces the two known dink08
+shoulder spikes, but NJd37 is a genuine local counterexample: near the repaired
+wrist, robot elbow peak acceleration in 13.82–14.26 s rises from 98.75 to
+136.41 rad/s² despite a slightly lower whole-clip jerk p95. This is not unrelated
+tail noise. Consequently only audit is accepted as the default; conservative
+remains experimental opt-in, not a generally regression-free correction.
+All 67 backend unit tests pass. No threshold was tuned to exclude this one clip.
+
 ## Optional foot-surface evidence from an existing prediction
 
 The default video inference export remains unchanged: it does not reconstruct a
