@@ -405,3 +405,44 @@ evidence records the additional exporter implementation identities.
 `simple_vo_workers=1` is the deterministic default. Higher values parallelize
 adjacent-frame matching but pycolmap RANSAC does not guarantee bitwise-identical
 results, so the worker count is part of MotiForge's cache and provenance.
+
+## 可选平地支撑姿态候选（2026-09-11，默认不执行）
+
+显式命令从原始 portable 人体缓存及其同目录 ViTPose/bbox 观测生成新候选，不重跑视频识别，
+不覆盖原始文件，也不改变默认推理的 backend revision/cache。此模块属于源侧，不包含机器人
+求解器或 MotiForge core 依赖。
+
+```bash
+PYTHONNOUSERSITE=1 python -m hmr4d.backends.support_pose INPUT.npz \
+  --output out/human-flat-support.npz --asset-root . --assume-flat-ground
+```
+
+必须显式确认平地，原输入标为固定机位，30Hz、6–1800帧，并保留其
+`native/motiforge/preprocess/{vitpose,bbx}.pt`。必须在其他脚面/姿态增强之前执行；重复精修、
+动态shape、世界/相机局部pose不一致、无可靠支撑或不匹配帧序拒绝。使用weights-only读取缓存。
+
+`_support_mask`结合模型静止概率/3D足速与图像高分低速踝观测，`_support_bias`从实际脚面构造
+平地高度偏差；双脚都无支撑证据时平滑采用共同偏差，避免逐脚独立压平真实腾空。`_fit`以
+L-BFGS联合拟合pelvis Y与双髋/膝/踝局部旋转，包含脚面、XY、投影、姿态幅度及二阶时序先验。
+shape、heading、root XZ、上肢局部pose保持；全模型FK、global/incam与脚面同步更新。
+ViTPose热图分数不等于概率，可超过1。投影/姿态/损失保护只排除明显失控，不证明恢复真值。
+
+输出保留源视频身份及原高度诊断，并新增`support_pose_refinement`、`support_pose_bias_y`与
+合法`smplx-foot-surface-v1`证据，记录源工件、模型、观测和算法SHA；标记
+`candidate_requires_review`。MotiForge端显式选`--foot-target-mode surface --ground`后走
+原公共Job/Quality/Sink，不自动将候选当作最终结果。现有CLI/Web视频入口不自动调用本模块。
+
+同十条90秒匹克球缓存验证：09关键浮脚14.61→0.34cm；物理B×1/C×9→A×1/B×1/C×8，
+Fidelity仍B×6/C×4。6条脚滑下降、03/08/09/10四条脚滑上升；10真实轻跳仍保留但高度改变。
+二维静止也可能是悬停抬脚，楼梯/物体支撑不适用，因此不能全批无条件采用。新增12项无模型
+测试与既有后端测试共133项通过；完整源/机器人对照及代价记录于MotiForge对应回归文档。
+本节点新增support_pose模块及其测试/本节说明；未改默认推理或源网络权重。
+该实验入口只接受尚未附加几何证据的原始缓存；已含 `smplx-sequence-v1` 的新导出会明确拒绝，
+防止优化后的姿态与保留下来的旧几何不一致，不自动移除或重写公共 sequence。
+
+## 公共 SMPL-X sequence（2026-09-15）
+
+最终预测现在默认附加 `smplx-sequence-v1`，保留原 protocol-3 字段；独立消费者可直接
+使用标准化的参数、body22 旋转和 bind，而不必重新恢复人体。旧缓存可用 `export-smplx`
+升级。它属于 Source 交换合同，不依赖 UMR 或机器人；详细字段、未观测手型、坐标枢轴、
+验证和兼容性见 [SMPLX_SEQUENCE.md](SMPLX_SEQUENCE.md)。

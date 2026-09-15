@@ -60,6 +60,12 @@ def _validated_prediction(input_path: Path) -> tuple[dict[str, np.ndarray], dict
     source_digest = hashlib.sha256(payload).hexdigest()
     with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
         arrays = {key: archive[key] for key in archive.files}
+    metadata = validate_prediction_arrays(arrays)
+    return arrays, metadata, source_digest
+
+
+def validate_prediction_arrays(arrays: dict[str, np.ndarray]) -> dict[str, Any]:
+    """Validate file and in-memory exports through the same prediction contract."""
     try:
         metadata = json.loads(arrays["motiforge_video_json"].item())
     except (KeyError, ValueError, TypeError) as exc:
@@ -91,7 +97,7 @@ def _validated_prediction(input_path: Path) -> tuple[dict[str, np.ndarray], dict
         value = arrays["floor_correction_y"]
         if value.shape != (frames,) or value.dtype.kind not in "fiu" or not np.isfinite(value).all():
             raise ValueError("floor_correction_y must contain T finite numeric values")
-    return arrays, metadata, source_digest
+    return metadata
 
 
 def _write_new_artifact(output_path: Path, arrays: dict[str, np.ndarray]) -> None:

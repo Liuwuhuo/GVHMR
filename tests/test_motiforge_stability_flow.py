@@ -103,12 +103,14 @@ class StabilityFlowTests(unittest.TestCase):
             portable = {"pred_w_j3d": np.ones((30, 22, 3)), "motiforge_video": {"fps": 30}}
             with patch.object(backend, "_compose_config", return_value=cfg), \
                  patch.object(backend, "_normalize_video"), \
+                 patch("hmr4d.backends.smplx_sequence.enrich_prediction") as enrich, \
                  patch.object(backend, "_portable_prediction", side_effect=lambda **kwargs: copy.deepcopy(portable)), \
                  patch("hmr4d.backends.observation_stability.evaluate_repair_candidate",
                        return_value={"accepted": True, "reasons": []}):
                 backend._process_item(item=item, options={"observation_stability": "conservative"},
                                       revision="rev", backend_id="backend", demo=demo,
                                       model=SimpleNamespace(predict=predict), detach_to_cpu=lambda x: x)
+            enrich.assert_called_once()
             self.assertEqual(len(seen), 2)
             self.assertTrue(torch.all(seen[0][10:12, 9, 0] == 90))
             self.assertTrue(torch.all(seen[1][10:12, 9, 0] == 10))
@@ -255,10 +257,12 @@ class StabilityFlowTests(unittest.TestCase):
                     "prediction": str(root / "result.npz"), "manifest": str(root / "manifest.json")}
             with patch.object(backend, "_compose_config", return_value=cfg), \
                  patch.object(backend, "_normalize_video"), \
+                 patch("hmr4d.backends.smplx_sequence.enrich_prediction") as enrich, \
                  patch.object(backend, "_predict_observation_candidate",
                               return_value=(gap, report, original, candidate, localized, gap)):
                 backend._process_item(item=item, options={"observation_stability": "off"}, revision="rev",
                                       backend_id="id", demo=demo, model=object(), detach_to_cpu=lambda x: x)
+            enrich.assert_called_once()
             for name, expected in (("observation_original", 1), ("observation_candidate", 2),
                                    ("observation_local_candidate", 3), ("observation_gap_candidate", 4), ("result", 4)):
                 with np.load(root / (name + ".npz"), allow_pickle=False) as value:

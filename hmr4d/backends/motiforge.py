@@ -70,7 +70,10 @@ def backend_revision() -> str:
     digest = hashlib.sha256()
     for path in (Path(__file__).resolve(), Path(__file__).with_name("observation_stability.py"),
                  Path(__file__).with_name("local_arm_repair.py"),
-                 Path(__file__).with_name("arm_gap_repair.py")):
+                 Path(__file__).with_name("arm_gap_repair.py"),
+                 Path(__file__).with_name("smplx_sequence.py"),
+                 Path(__file__).with_name("body_pose.py"),
+                 Path(__file__).with_name("portable.py")):
         digest.update(path.name.encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()[:12]
@@ -1028,6 +1031,9 @@ def _process_item(
         _atomic_json(output_dir / "observation_stability.json", stability)
 
     prediction = Path(item["prediction"])
+    from hmr4d.backends.smplx_sequence import enrich_prediction
+
+    enrich_prediction(portable, Path("inputs/checkpoints/body_models/smplx/SMPLX_NEUTRAL.npz"))
     _write_portable_npz(prediction, portable)
     manifest = {
         "status": "complete",
@@ -1155,11 +1161,27 @@ def main(argv: list[str] | None = None) -> int:
             "backend": BACKEND_NAME,
             "protocol": PROTOCOL_VERSION,
             "backend_revision": backend_revision(),
-            "capabilities": {"observation_stability": list(OBSERVATION_STABILITY_MODES)},
+            "capabilities": {"observation_stability": list(OBSERVATION_STABILITY_MODES),
+                             "smplx_sequence": "smplx-sequence-v1"},
         }))
         return 0
     if argv[:1] == ["doctor"]:
         return _doctor_command(argv[1:])
+    if argv[:1] == ["export-smplx"]:
+        parser = argparse.ArgumentParser(description="Export an engine-independent SMPL-X sequence")
+        parser.add_argument("input", type=Path)
+        parser.add_argument("--output", required=True, type=Path)
+        parser.add_argument("--asset-root", required=True, type=Path)
+        args = parser.parse_args(argv[1:])
+        from hmr4d.backends.smplx_sequence import export_sequence
+
+        try:
+            report = export_sequence(args.input, args.output, args.asset_root)
+        except Exception as exc:
+            print(f"SMPL-X export failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
     if argv[:1] == ["export-body-pose"]:
         parser = argparse.ArgumentParser(description="Add validated SMPL-X body22 pose evidence to a new portable NPZ")
         parser.add_argument("input", type=Path)
@@ -1196,7 +1218,8 @@ def main(argv: list[str] | None = None) -> int:
         "usage: python -m hmr4d.backends.motiforge "
         "capabilities | doctor --asset-root DIR | run REQUEST_JSON RESPONSE_JSON | "
         "export-foot-surface INPUT --output OUTPUT --asset-root DIR | "
-        "export-body-pose INPUT --output OUTPUT --asset-root DIR",
+        "export-body-pose INPUT --output OUTPUT --asset-root DIR | "
+        "export-smplx INPUT --output OUTPUT --asset-root DIR",
         file=sys.stderr,
     )
     return 2
