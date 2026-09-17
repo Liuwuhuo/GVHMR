@@ -46,12 +46,39 @@ The versioned `hmr4d.backends.motiforge` entry point lets the sibling MotiForge
 project orchestrate headless GVHMR inference without sharing Python environments
 or vendoring this code. Setup, runtime checks and the portable artifact contract
 are documented in [docs/MOTIFORGE_BACKEND.md](docs/MOTIFORGE_BACKEND.md). The
-backend also exports the checkpoint's static-foot confidence and uses sustained
-support to estimate vertical world-floor drift. For a fixed camera it first
-corrects the low-frequency world/raw-in-camera height discrepancy, then limits
-the combined source-Y correction to 0.2 m/s. Shared camera/world jumps and squats
-cancel before the discrepancy filter; missing static support is not a flight
-label. This source correction can be disabled from MotiForge for ablation.
+backend also exports the checkpoint's static-foot confidence, but this predicts
+low joint speed, NOT physical contact. Custom static-support ground anchors are
+disabled; the native network and native postprocessing are unchanged. For a fixed
+camera, a separate low-frequency world/raw-in-camera height discrepancy correction
+remains, rate-limited to 0.2 m/s. Shared camera/world jumps and squats cancel before
+this discrepancy filter. This source correction can be disabled for ablation.
+
+The selected prediction now also uses actual SMPL-X foot surfaces to enforce
+the world-zero plane. The surface stage only lifts penetration risks, never pulls
+floating feet down; the total vertical correction remains rate-limited. This
+flat-ground policy changes only global height, preserves incam and pose/shape,
+and rebuilds portable geometry afterwards. Residual penetration is a source error;
+elevated feet require review, not rejection based on static-support probabilities.
+Use `export-ground INPUT --output NEW_OUTPUT --asset-root DIR` to reprocess an
+existing enabled-ground cache without video inference or overwriting its input.
+It first undoes the cached custom correction, so old support anchors are not retained.
+An explicitly confirmed grounded interval can additionally calibrate ONE fixed
+height offset: add `--reference-start 0 --reference-duration 0.5
+--assume-reference-grounded`. This is opt-in, not an automatic support detector;
+it retains the camera reference and nonpenetration guard and records large
+subsequent adjustments for review. Do not assume arbitrary clips start grounded.
+Disable source ground stabilization for stairs/object-supported motions; inspect
+the resulting source independently. See the backend document for limits and evidence.
+
+For an explicitly declared flat-floor clip with at least one foot grounded in
+every frame, the opt-in request option `assume_grounded: true` (or cached
+`export-ground --assume-grounded`) projects the lower actual foot surface to zero.
+It preserves articulation, shape, horizontal motion and incam, but removes real
+flight and may transfer foot-estimation noise into root height. It is NOT enabled
+by default or inferred from static-foot confidence. Requires source ground enabled;
+cannot combine with a reference window. The v4 report records the assumption and
+fast correction warnings. Original/v2/v3 caches may be re-exported into a new path,
+after undoing the previous total correction; repeated v4 exports are rejected.
 
 Existing portable predictions can be explicitly augmented with geometric foot
 surfaces (`export-foot-surface`) or validated world-space body22 rotations and a

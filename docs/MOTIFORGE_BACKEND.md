@@ -12,6 +12,133 @@ request/response protocol.
 
 ## Runtime check
 
+### Explicit no-flight source projection (opt-in, 2026-09-16)
+
+Request `options.assume_grounded` is a boolean, default false. When true, source
+ground stabilization must be enabled. Both capabilities and doctor advertise
+`assume_grounded: true`; clients must negotiate support, not silently drop it.
+Fresh inference carries the flag through `_portable_prediction` and
+`smplx_sequence.enrich_prediction` into `surface_ground.add_surface_ground`.
+
+```bash
+python -m hmr4d.backends.motiforge export-ground INPUT.npz \
+  --output out/assume-grounded.npz --asset-root . --assume-grounded
+```
+
+The operator declares at least one foot touching the same zero-height flat floor
+EVERY frame. Let `s` be current left/right SMPL-X foot surfaces and `c0` the
+previous downward correction: use total `c=c0+min(s)`, translate world joints and
+global translation by `c0-c`, and rebuild/validate the portable sequence. Pose,
+shape, root orientation, horizontal motion and incam remain unchanged. Static
+probabilities neither choose supports nor authorize this operation. Original
+parameters/correction/surfaces and input provenance are retained.
+
+This removes real flight; do NOT apply to jumping, airborne running, stairs or
+object support. Exact per-frame contact cannot also guarantee a fixed correction
+speed cap. v4 reports `removes_real_flight=true`, the actual correction speed and
+`grounded_projection_fast_height_change` above 0.2 m/s. Root jitter remains a
+review concern; this is not a pose/dynamics/sliding/collision solver. Original,
+v2 and v3 caches can be re-exported after undoing their TOTAL correction, never
+overwriting input. Reject reference-window combinations and repeated v4 exports.
+Default/disabled behavior and real jumps remain unchanged when the option is off.
+
+Six real-source regression inputs (2114 frames) preserve pose/XY/incam and produce
+zero lower-foot height with FK error <2 micrometers. Three matched Adam SP/UMR
+50 Hz pairs reduced >3 cm dual-foot elevation from 90.77/8.94/17.88% to zero;
+quality C/C/C became B/C/C, not universal acceptance. One clip's slip increased
+~20%, another retains ~43.5 mm self-penetration. The reported cz4Z clip's source
+vertical acceleration p95 increased 3.42 to 8.90 m/s²; no smoothing improvement
+is claimed. Full backend suite: 170 tests. Main integration: 1680 passed, 2 skipped.
+
+### Flat-ground surface correction (2026-09-16)
+
+After observation candidate selection, `smplx_sequence.enrich_prediction` calls
+`surface_ground.add_surface_ground` before creating the portable sequence. CPU
+SMPL-X FK supplies the same weight-selected feet as `export-foot-surface`, and
+checks body22 against the portable joints (0.1 mm tolerance). The checkpoint's
+static probability is trained from joint speed, not physical ground contact.
+Both custom static-support anchor stages are now disabled. The earlier
+joint-height percentile is NOT the final ground plane.
+
+If `c0` was already subtracted and `s` is the current surface, the desired total
+correction ceiling is `min(c0, min(s) + c0)`, combining no-downward-shift with
+world Y=0 nonpenetration. A two-sided Lipschitz minorant with slope 0.2 m/s
+enforces nonpenetration and limits the TOTAL correction, not two separately
+limited stages. Joints and global translation receive the same `c0-c` shift;
+pose, shape, XY and incam remain unchanged. Sequence FK is regenerated. This
+`foot-surface-ground-v2` stage only raises the person and never removes a positive
+height offset. Rate limiting can also lift adjacent frames before a penetration;
+nonpenetration does not prove correct ground contact or overall height accuracy.
+
+`foot_surface_y` and `surface_ground` diagnostics are now automatic. When enabled,
+the source declares an error if a surface is below -2 mm. Elevated feet (>3 cm) are advisory
+`review`, never claimed to be valid flight. `ground_input_transl`,
+`ground_input_floor_correction_y`, `ground_input_foot_surface_y` preserve the input;
+`ground_stabilization` diagnostics describe the camera-only preceding stage.
+Disabled source ground leaves every pre-existing numeric field unchanged. This
+is a flat-ground assumption, not stair/object support or a physical motion fit.
+
+MotiForge reads the numeric report into its generic source validation contract.
+Inspection stays available, but execution rejects declared source errors before
+any engine, except the withdrawn v1 static-support-residual rejection, now advisory.
+Old caches are not implicitly modified or certified. Reprocess into
+a NEW path using the same implementation:
+
+```bash
+python -m hmr4d.backends.motiforge export-ground INPUT.npz \
+  --output out/ground-checked.npz --asset-root .
+```
+
+The command requires an enabled-ground original cache and rejects double correction.
+It first undoes that cache's `floor_correction_y`, recomputes camera-only height,
+then applies surface nonpenetration; it does NOT keep the old contact-floor shift.
+An applied legacy correction without its numeric array is rejected.
+Derived body22/SMPL-X geometry is regenerated, not left stale. Backend identity
+includes both surface helpers, so new inference cannot hit the old ground cache.
+
+Two reported C3-P4yh5yos clips were re-exported from their original caches. Both
+now have nonnegative foot surfaces, but the lower-foot-above-3-cm fractions are
+109/356 and 177/198: disabling anchors is NOT an overall height improvement.
+The earlier v1 rejected the second clip at static-support residual p95 8.67 cm;
+that rejection was based on incorrect static/contact semantics, not established
+invalid human posture. Tests cover stance, swing, real flight, probability
+independence, fast negative excursions, disabled parity and stale geometry.
+
+### Explicit grounded reference window (opt-in, 2026-09-16)
+
+```bash
+python -m hmr4d.backends.motiforge export-ground INPUT.npz \
+  --output out/human-calibrated.npz --asset-root . \
+  --reference-start 0 --reference-duration 0.5 --assume-reference-grounded
+```
+
+The operator confirms at least one foot is on the same flat floor during this
+interval; this is not inferred from the checkpoint's static probabilities. It
+must be within the original timeline and contain at least 0.1 s and 3 samples.
+The median lower-foot surface provides ONE constant offset `b`. The final total
+correction is the 0.2 m/s Lipschitz minorant of `min(c0+b, min(s)+c0)`. Thus the
+constant calibration can lower an initially floating body, but subsequent
+nonpenetration only raises it relative to this fixed reference. Real jumps are
+not explicitly pulled down. Pose, shape, XY and incam remain unchanged; FK and
+the sequence are rebuilt as in the uncalibrated export.
+
+The `foot-surface-ground-v3` report records the reference interval, offset,
+reference height spread and maximum additional nonpenetration shift. Spread
+over 5 cm and a shift over 10 cm are advisory review warnings, not certified
+support. A large shift must not be described as a small refinement. The first
+interval can be airborne or occluded; choose another confirmed interval instead.
+This does not calibrate scale/gravity or guarantee later root-height accuracy.
+
+For explicit calibration, a fresh `foot-surface-ground-v2` inference artifact is
+also accepted when its numeric total `floor_correction_y` is present. Export
+undoes that total before recomputing camera/reference/geometry; it does not stack
+a second correction. v3 recalibration remains rejected. Original and v2 inputs
+are covered by an equivalence test.
+Default video inference and exports without these flags stay unchanged (v2).
+The calibrated NPZ is accepted by the regular MotiForge reader/retarget pipeline.
+
+### Backend availability
+
 `python -m hmr4d.backends.motiforge capabilities` provides lightweight protocol,
 mode and implementation identity negotiation without importing Torch or loading
 checkpoints. Default source identity covers the adapter and its observation
@@ -55,7 +182,8 @@ python -m hmr4d.backends.motiforge run request.json response.json
 ```
 
 The portable prediction contains world body joints, global/in-camera SMPL-X
-parameters, camera intrinsics, left/right foot-contact confidence, the applied
+parameters, camera intrinsics, left/right static-foot probability (legacy
+`contact_confidence` fields, not physical contact confidence), the applied
 world-Y floor correction, source SHA-256, inference options, the GVHMR Git
 revision and backend revision. Writes use temporary files followed by atomic
 replacement; one bad video does not abort the rest of a batch.
@@ -65,38 +193,31 @@ with a 0.25 m discrepancy dead zone, followed by a horizontal-only static-joint
 correction. It does not leave Y entirely untouched, but residual height drift
 inside the camera dead zone can remain.
 
-The backend's legacy `contact-floor-v1` estimates the slow floor component from
-sustained ankle/foot static probabilities predicted by the same checkpoint.
-Frames without confident static support are not floor anchors: low static
-probability can also mean sliding contact or fast steps, not flight. Its desired
-interpolated floor correction is clipped to +/-0.25 m before a joint-height
-ceiling and a 0.2 m/s rate constraint are applied. This is not mesh-sole collision
-grounding.
+The legacy `contact-floor-v1` helper is retained only for historical experiments;
+production inference no longer calls it. Neither high nor low ankle/foot static
+probability establishes support or flight. Native GVHMR postprocessing is unchanged.
 
 Only when both `static_camera` and `ground_stabilization` are enabled, the backend
-uses `static-camera-contact-floor-v2`: reconstruct the raw in-camera pelvis,
+uses `camera-height-no-support-v3`: reconstruct the raw in-camera pelvis,
 map it with the original frame-zero camera-to-world rotation, and Gaussian-filter
 only the world-minus-camera Y discrepancy with sigma=0.5 seconds (nearest edge
 padding, truncate=4). The camera translation is not independently smoothed, so
 real vertical motion shared by both representations cancels before filtering.
 The first camera correction sample is subtracted to retain the original initial
-height gauge. The existing floor algorithm then runs on this camera-corrected
-prediction. Camera and floor corrections are summed and jointly projected through
-the same 0.2 m/s Lipschitz minorant, preventing two individually bounded stages
-from exceeding the total speed limit. The total correction is not subject to a
-separate 0.25 m amplitude cap. Exactly the same exported `floor_correction_y` is
+height gauge. This correction is projected through a 0.2 m/s Lipschitz minorant;
+no contact-floor stage follows. The surface-only stage above also constrains the
+TOTAL correction. There is no separate 0.25 m amplitude cap. The exported total
+`floor_correction_y` is
 subtracted once from the original world-joint Y and global SMPL translation Y;
 XZ, root-relative pose, in-camera parameters and source confidence are unchanged
 apart from float32 rounding. This does not hard-snap each frame to the floor.
 
-Dynamic cameras and disabled stabilization retain the exact legacy numerical
-path. Missing or insufficient static support also retains the legacy fallback.
-Missing, malformed or nonfinite in-camera parameters fall back with an explicit
-`camera_stage.reason` and `detail`; they are not silently treated as reliable
-camera evidence. Top-level ground diagnostics describe the final total
-correction, final support-height p95 error and final speed, while `camera_stage`
-and `floor_stage` describe their individual stages. In particular a floor stage
-below its 5 mm threshold can still produce an applied camera-only total.
+Dynamic cameras and disabled stabilization make no pre-surface height change.
+Missing, malformed or nonfinite in-camera parameters also leave this stage
+unchanged with an explicit `camera_stage.reason` and `detail`, never falling back
+to contact anchors. `ground_stabilization.support_anchor_enabled` is false.
+Final surface diagnostics describe actual nonpenetration and unknown elevations;
+there is no static-support-height rejection.
 
 MotiForge enables source ground stabilization by default. Use
 `--gvhmr-no-ground-stabilization` on `motiforge video` to reproduce the raw
@@ -104,10 +225,9 @@ upstream world-Y behavior. Robot sole clearance and collision grounding remain
 downstream retarget concerns, so Mink dataset generation should still use
 `--ground`.
 
-`ground_stabilization.static_support_missing_frames` counts frames without a
-retained static-foot anchor. The old `flight_frames` key remains as a deprecated
-alias with exactly the same value; it is not a flight classification. The legacy
-`contact-floor-v1` numerical helper and protocol-3 format remain unchanged. The
+Historical `static_support_missing_frames`/`flight_frames` fields from the old
+helper are NOT flight classifications and are not used by the current height
+path. The legacy `contact-floor-v1` helper and protocol-3 format remain readable. The
 backend file's content revision invalidates caches when this source algorithm
 changes; no retarget-engine options enter this source artifact identity.
 

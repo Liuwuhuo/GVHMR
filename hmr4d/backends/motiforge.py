@@ -72,6 +72,8 @@ def backend_revision() -> str:
                  Path(__file__).with_name("local_arm_repair.py"),
                  Path(__file__).with_name("arm_gap_repair.py"),
                  Path(__file__).with_name("smplx_sequence.py"),
+                 Path(__file__).with_name("surface_ground.py"),
+                 Path(__file__).with_name("foot_surface.py"),
                  Path(__file__).with_name("body_pose.py"),
                  Path(__file__).with_name("portable.py")):
         digest.update(path.name.encode())
@@ -244,7 +246,7 @@ def diagnose(
         "asset_root": str(asset_root),
         "gvhmr_revision": project_revision(),
         "backend_revision": backend_revision(),
-        "capabilities": {"observation_stability": list(OBSERVATION_STABILITY_MODES)},
+        "capabilities": {"observation_stability": list(OBSERVATION_STABILITY_MODES), "assume_grounded": True},
         "ok": not errors,
         "checks": checks,
         "errors": [f"{item['name']}: {item['detail']}" for item in errors],
@@ -295,7 +297,10 @@ def _normalize_video(source: Path, destination: Path, options: dict[str, Any]) -
 
 
 def _contact_confidence(pred: dict[str, Any], frame_count: int) -> tuple[np.ndarray, np.ndarray] | None:
-    """Extract the checkpoint's semantic left/right foot contact confidence."""
+    """Export static-joint probabilities under the legacy contact field names.
+
+    Static joints are not necessarily supporting or touching the ground.
+    """
 
     net_outputs = pred.get("net_outputs")
     if not isinstance(net_outputs, dict):
@@ -579,80 +584,51 @@ def _stabilize_prediction_ground(
     enabled: bool,
     static_camera: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    """Compose static-camera height and legacy floor corrections in source Y.
+    """Camera-height correction only; static-joint probabilities are NOT support.
 
-    Dynamic cameras, disabled stabilization and missing support keep the exact
-    legacy numerical path. Invalid camera parameters also fall back explicitly.
-    The single exported correction is applied once to the original prediction
-    and its *total* speed, not just each stage's speed, is bounded at 0.2 m/s.
+    The legacy contact-floor helper remains for historical experiments, but is
+    not part of inference. Real-surface nonpenetration follows final selection.
     """
-
-    legacy = _stabilize_world_ground(joints, transl, contacts, fps=fps, enabled=enabled)
+    del contacts  # Keep the call contract, not the old support interpretation.
+    world = np.asarray(joints, dtype=np.float32).copy()
+    root = np.asarray(transl, dtype=np.float32).copy()
+    correction = np.zeros(len(world), dtype=np.float32)
+    diagnostics = {
+        "version": "camera-height-no-support-v3", "enabled": bool(enabled),
+        "applied": False, "support_anchor_enabled": False,
+    }
     if not enabled or not static_camera:
-        return legacy
-    if legacy[3].get("reason") in {"contact_confidence_unavailable", "insufficient_contact"}:
-        legacy[3]["camera_stage"] = {"applied": False, "reason": legacy[3]["reason"]}
-        return legacy
+        diagnostics["reason"] = "disabled" if not enabled else "dynamic_camera_no_height_reference"
+        return world, root, correction, diagnostics
     try:
         camera_correction, camera_diagnostics = _static_camera_height_correction(
             joints, transl, global_orient, incam, fps=fps
         )
     except (TypeError, ValueError, AttributeError) as exc:
-        legacy[3]["camera_stage"] = {
+        diagnostics["camera_stage"] = {
             "applied": False,
             "reason": "invalid_or_missing_incam_parameters",
             "detail": str(exc),
         }
-        return legacy
+        return world, root, correction, diagnostics
 
-    camera_world = np.asarray(joints, dtype=np.float64).copy()
-    camera_root = np.asarray(transl, dtype=np.float64).copy()
-    camera_world[:, :, 1] -= camera_correction[:, None]
-    camera_root[:, 1] -= camera_correction
-    _, _, floor_correction, floor_diagnostics = _stabilize_world_ground(
-        camera_world, camera_root, contacts, fps=fps, enabled=True
-    )
-    desired_total = camera_correction + floor_correction
+    desired_total = camera_correction
     correction = _lipschitz_minorant(desired_total, _MAX_GROUND_SPEED_MPS / fps).astype(
         np.float32
     )
-    world = np.asarray(joints, dtype=np.float32).copy()
-    root = np.asarray(transl, dtype=np.float32).copy()
     world[:, :, 1] -= correction[:, None]
     root[:, 1] -= correction
 
-    minimum_run = max(2, round(fps * 0.10))
-    left_contact, right_contact = (
-        _remove_short_runs(confidence >= _CONTACT_THRESHOLD, minimum_run)
-        for confidence in contacts
-    )
-    left_y = np.minimum(world[:, 7, 1], world[:, 10, 1])
-    right_y = np.minimum(world[:, 8, 1], world[:, 11, 1])
-    support_y = np.minimum(
-        np.where(left_contact, left_y, np.inf), np.where(right_contact, right_y, np.inf)
-    )[left_contact | right_contact]
-    target_height = floor_diagnostics["target_foot_height_m"]
-    diagnostics = {
-        "version": "static-camera-contact-floor-v2",
-        "enabled": True,
+    diagnostics.update({
         "applied": bool(np.any(correction != 0.0)),
-        "contact_threshold": _CONTACT_THRESHOLD,
-        "contact_frames": floor_diagnostics["contact_frames"],
-        "static_support_missing_frames": floor_diagnostics["static_support_missing_frames"],
-        "flight_frames": floor_diagnostics["flight_frames"],  # Deprecated alias, not flight.
         "camera_stage": camera_diagnostics,
-        "floor_stage": floor_diagnostics,
-        "correction_composition": "camera_plus_floor_then_lipschitz_minorant",
+        "correction_composition": "camera_only_then_lipschitz_minorant",
         "total_speed_limit_mps": _MAX_GROUND_SPEED_MPS,
         "total_projection_max_change_m": float(np.max(np.abs(correction - desired_total))),
-        "target_foot_height_m": target_height,
         "max_abs_correction_m": float(np.max(np.abs(correction))),
         "p95_abs_correction_m": float(np.percentile(np.abs(correction), 95.0)),
-        "contact_height_p95_error_m": float(
-            np.percentile(np.abs(support_y - target_height), 95.0)
-        ),
-        "max_correction_speed_mps": float(np.max(np.abs(np.diff(correction))) * fps),
-    }
+        "max_correction_speed_mps": float(np.max(np.abs(np.diff(correction)), initial=0) * fps),
+    })
     return world, root, correction, diagnostics
 
 
@@ -711,6 +687,7 @@ def _portable_prediction(
             "mirror": bool(options.get("mirror", False)),
             "max_frames": options.get("max_frames"),
             "ground_stabilization": ground_diagnostics,
+            "assume_grounded": options.get("assume_grounded", False),
         },
     }
     if contacts is not None:
@@ -1026,14 +1003,13 @@ def _process_item(
         _write_portable_npz(output_dir / "observation_gap_candidate.npz", gap)
         stability["candidate_evidence"]["gap"] = "observation_gap_candidate.npz"
         stability["candidate_evidence"]["gap_scope"] = "short anchored local-rotation gap/FK before temporal selection"
-    _finish_observation_stability(portable, stability)
-    if stability is not None:
-        _atomic_json(output_dir / "observation_stability.json", stability)
-
     prediction = Path(item["prediction"])
     from hmr4d.backends.smplx_sequence import enrich_prediction
 
     enrich_prediction(portable, Path("inputs/checkpoints/body_models/smplx/SMPLX_NEUTRAL.npz"))
+    _finish_observation_stability(portable, stability)
+    if stability is not None:
+        _atomic_json(output_dir / "observation_stability.json", stability)
     _write_portable_npz(prediction, portable)
     manifest = {
         "status": "complete",
@@ -1071,6 +1047,9 @@ def run_request(request_path: Path, response_path: Path) -> int:
             raise RuntimeError("请求中的 GVHMR backend revision 与当前代码不一致")
         asset_root = Path(request["asset_root"]).expanduser().resolve()
         options = dict(request.get("options", {}))
+        grounded = options.get("assume_grounded", False)
+        if type(grounded) is not bool or (grounded and not options.get("ground_stabilization", True)):
+            raise ValueError("assume_grounded must be boolean and requires ground_stabilization")
         if options.get("observation_stability", "audit") not in OBSERVATION_STABILITY_MODES:
             raise ValueError("observation_stability must be off, audit or conservative")
         items = list(request.get("items", []))
@@ -1161,12 +1140,39 @@ def main(argv: list[str] | None = None) -> int:
             "backend": BACKEND_NAME,
             "protocol": PROTOCOL_VERSION,
             "backend_revision": backend_revision(),
-            "capabilities": {"observation_stability": list(OBSERVATION_STABILITY_MODES),
+            "capabilities": {"observation_stability": list(OBSERVATION_STABILITY_MODES), "assume_grounded": True,
                              "smplx_sequence": "smplx-sequence-v1"},
         }))
         return 0
     if argv[:1] == ["doctor"]:
         return _doctor_command(argv[1:])
+    if argv[:1] == ["export-ground"]:
+        parser = argparse.ArgumentParser(description="Revalidate a flat-ground source into a NEW portable NPZ")
+        parser.add_argument("input", type=Path)
+        parser.add_argument("--output", required=True, type=Path)
+        parser.add_argument("--asset-root", required=True, type=Path)
+        parser.add_argument("--reference-start", type=float, help="Known grounded interval start, seconds")
+        parser.add_argument("--reference-duration", type=float, help="Known grounded interval duration, seconds")
+        parser.add_argument("--assume-grounded", action="store_true",
+                            help="Assume one foot contacts flat ground every frame; removes real flight")
+        parser.add_argument("--assume-reference-grounded", action="store_true",
+                            help="Explicitly confirm at least one foot contacts a flat floor in the interval")
+        args = parser.parse_args(argv[1:])
+        reference_window = None
+        if args.assume_reference_grounded or args.reference_start is not None or args.reference_duration is not None:
+            if not args.assume_reference_grounded or args.reference_start is None or args.reference_duration is None:
+                parser.error("Ground calibration requires both reference times and --assume-reference-grounded")
+            reference_window = (args.reference_start, args.reference_start + args.reference_duration)
+        from hmr4d.backends.surface_ground import export_ground
+
+        try:
+            report = export_ground(args.input, args.output, args.asset_root, backend_id=backend_revision(),
+                                   reference_window=reference_window, assume_grounded=args.assume_grounded)
+        except Exception as exc:
+            print(f"ground export failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
     if argv[:1] == ["export-smplx"]:
         parser = argparse.ArgumentParser(description="Export an engine-independent SMPL-X sequence")
         parser.add_argument("input", type=Path)
@@ -1219,6 +1225,7 @@ def main(argv: list[str] | None = None) -> int:
         "capabilities | doctor --asset-root DIR | run REQUEST_JSON RESPONSE_JSON | "
         "export-foot-surface INPUT --output OUTPUT --asset-root DIR | "
         "export-body-pose INPUT --output OUTPUT --asset-root DIR | "
+        "export-ground INPUT --output OUTPUT --asset-root DIR | "
         "export-smplx INPUT --output OUTPUT --asset-root DIR",
         file=sys.stderr,
     )

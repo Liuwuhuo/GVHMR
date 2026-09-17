@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -13,6 +14,22 @@ import test_motiforge_body_pose as fixture
 
 
 class SMPLXSequenceTests(unittest.TestCase):
+    def test_fresh_prediction_forwards_explicit_ground_assumption(self):
+        from hmr4d.backends.smplx_sequence import enrich_prediction
+        for enabled in (False, True):
+            portable = {'motiforge_video': {'ground_stabilization': {'enabled': True},
+                                            'assume_grounded': enabled},
+                        'smpl_params_global': {'transl': np.zeros((1, 3))}}
+            enriched = {'smpl_params_global.transl': np.zeros((1, 3)),
+                        'motiforge_video_json': np.asarray(json.dumps(portable['motiforge_video']))}
+            with patch('hmr4d.backends.smplx_sequence._load_body_model'), \
+                 patch('hmr4d.backends.smplx_sequence._sha256', return_value='0'*64), \
+                 patch('hmr4d.backends.motiforge._portable_arrays', return_value={}), \
+                 patch('hmr4d.backends.surface_ground.add_surface_ground', return_value={}) as ground, \
+                 patch('hmr4d.backends.smplx_sequence.add_sequence', return_value=enriched):
+                enrich_prediction(portable, Path('model.npz'))
+                self.assertEqual(ground.call_args.kwargs['assume_grounded'], enabled)
+
     def setUp(self):
         self.model = fixture.FakeBodyModel()
         self.model.bm.left_hand_mean = torch.linspace(-.1, .2, 45)

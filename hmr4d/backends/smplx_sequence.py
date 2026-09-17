@@ -84,9 +84,19 @@ def add_sequence(arrays, model_path, *, model_factory=None):
 def enrich_prediction(portable, model_path):
     """Called once after the final complete prediction has been selected."""
     from hmr4d.backends.motiforge import _portable_arrays
+    from hmr4d.backends.surface_ground import add_surface_ground
 
-    enriched = add_sequence(_portable_arrays(portable), model_path)
-    portable.update({key: enriched[key] for key in enriched if key.startswith("smplx.")})
+    model = _load_body_model(Path(model_path))
+    arrays = add_surface_ground(
+        _portable_arrays(portable), model,
+        enabled=bool(portable["motiforge_video"].get("ground_stabilization", {}).get("enabled", False)),
+        model_digest=_sha256(Path(model_path)),
+        assume_grounded=portable["motiforge_video"].get("assume_grounded", False),
+    )
+    enriched = add_sequence(arrays, model_path, model_factory=lambda _: model)
+    portable["smpl_params_global"]["transl"] = enriched["smpl_params_global.transl"]
+    portable.update({key: value for key, value in enriched.items()
+                     if not key.startswith("smpl_params_") and key != "motiforge_video_json"})
     portable["motiforge_video"] = json.loads(str(enriched["motiforge_video_json"]))
 
 

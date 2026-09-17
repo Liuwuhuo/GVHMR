@@ -132,11 +132,10 @@ class StaticCameraHeightTests(unittest.TestCase):
         self.assertGreater(diagnostics["total_projection_max_change_m"], 0.01)
         self.assertEqual(diagnostics["max_correction_speed_mps"], speed)
         self.assertEqual(diagnostics["total_speed_limit_mps"], 0.2)
-        self.assertEqual(diagnostics["version"], "static-camera-contact-floor-v2")
+        self.assertEqual(diagnostics["version"], "camera-height-no-support-v3")
         self.assertEqual(diagnostics["max_abs_correction_m"], float(np.abs(correction).max()))
-        feet = world[:, [7, 8, 10, 11], 1].min(axis=1)
-        residual = np.percentile(np.abs(feet - diagnostics["target_foot_height_m"]), 95)
-        self.assertEqual(diagnostics["contact_height_p95_error_m"], float(residual))
+        self.assertFalse(diagnostics["support_anchor_enabled"])
+        self.assertNotIn("target_foot_height_m", diagnostics)
 
     def test_below_threshold_floor_still_exports_camera_only_total_and_final_metrics(self):
         old_drift = 0.08 * self.time + 0.07 * np.sin(1.2 * self.time)
@@ -147,55 +146,45 @@ class StaticCameraHeightTests(unittest.TestCase):
             self.world, self.transl, self.orient, self.incam, fps=self.fps
         )
         world, _, correction, diagnostics = self.stabilize()
-        self.assertFalse(diagnostics["floor_stage"]["applied"])
-        self.assertEqual(diagnostics["floor_stage"]["reason"], "correction_below_threshold")
+        self.assertNotIn("floor_stage", diagnostics)
         self.assertTrue(diagnostics["applied"])
         self.assertTrue(diagnostics["camera_stage"]["applied"])
         self.assertNotIn("reason", diagnostics)
         np.testing.assert_array_equal(correction, camera.astype(np.float32))
         self.assertEqual(diagnostics["max_abs_correction_m"], float(np.abs(correction).max()))
-        feet = world[:, [7, 8, 10, 11], 1].min(axis=1)
-        residual = np.percentile(np.abs(feet - diagnostics["target_foot_height_m"]), 95)
-        self.assertEqual(diagnostics["contact_height_p95_error_m"], float(residual))
+        self.assertFalse(diagnostics["support_anchor_enabled"])
 
-    def test_dynamic_and_disabled_keep_exact_legacy_path_even_with_invalid_incam(self):
+    def test_dynamic_and_disabled_do_not_apply_custom_support_even_with_invalid_incam(self):
         for enabled, static in ((True, False), (False, True), (False, False)):
-            expected = _stabilize_world_ground(
-                self.world, self.transl, self.contacts, fps=self.fps, enabled=enabled
-            )
             actual = self.stabilize(incam={}, enabled=enabled, static_camera=static)
-            for left, right in zip(actual[:3], expected[:3]):
-                np.testing.assert_array_equal(left, right)
-            self.assertEqual(actual[3], expected[3])
+            np.testing.assert_array_equal(actual[0], self.world.astype('f4'))
+            np.testing.assert_array_equal(actual[1], self.transl.astype('f4'))
+            np.testing.assert_array_equal(actual[2], 0)
+            self.assertFalse(actual[3]['support_anchor_enabled'])
 
-    def test_missing_or_insufficient_contact_keeps_legacy_fallback(self):
+    def test_camera_path_is_independent_of_static_probabilities(self):
         brief = np.zeros(len(self.time))
         brief[:2] = 1
+        expected = self.stabilize()
         for contacts in (None, (brief, brief), (brief * 0, brief * 0)):
-            expected = _stabilize_world_ground(
-                self.world, self.transl, contacts, fps=self.fps, enabled=True
-            )
             actual = _stabilize_prediction_ground(
                 self.world, self.transl, contacts, global_orient=self.orient,
                 incam=self.incam, fps=self.fps, enabled=True, static_camera=True,
             )
             for left, right in zip(actual[:3], expected[:3]):
                 np.testing.assert_array_equal(left, right)
-            self.assertEqual(actual[3]["version"], "contact-floor-v1")
-            self.assertEqual(actual[3]["camera_stage"]["reason"], expected[3]["reason"])
+            self.assertEqual(actual[3], expected[3])
 
-    def test_missing_invalid_camera_is_auditable_legacy_fallback(self):
-        expected = _stabilize_world_ground(
-            self.world, self.transl, self.contacts, fps=self.fps, enabled=True
-        )
+    def test_missing_invalid_camera_does_not_fall_back_to_support(self):
         for incam in (None, {}, {**self.incam, "transl": np.zeros((2, 3))},
                       {**self.incam, "global_orient": self.orient + np.nan}):
             actual = _stabilize_prediction_ground(
                 self.world, self.transl, self.contacts, global_orient=self.orient,
                 incam=incam, fps=self.fps, enabled=True, static_camera=True,
             )
-            for left, right in zip(actual[:3], expected[:3]):
-                np.testing.assert_array_equal(left, right)
+            np.testing.assert_array_equal(actual[0], self.world.astype('f4'))
+            np.testing.assert_array_equal(actual[1], self.transl.astype('f4'))
+            np.testing.assert_array_equal(actual[2], 0)
             camera = actual[3]["camera_stage"]
             self.assertFalse(camera["applied"])
             self.assertEqual(camera["reason"], "invalid_or_missing_incam_parameters")
@@ -232,7 +221,7 @@ class StaticCameraHeightTests(unittest.TestCase):
             revision="revision", backend_id="backend", normalized_frames=len(world),
         )
         diagnostics = portable["motiforge_video"]["ground_stabilization"]
-        self.assertEqual(diagnostics["version"], "static-camera-contact-floor-v2")
+        self.assertEqual(diagnostics["version"], "camera-height-no-support-v3")
         expected = original.numpy().copy()
         expected[:, 1] -= portable["floor_correction_y"]
         np.testing.assert_array_equal(portable["smpl_params_global"]["transl"], expected)
